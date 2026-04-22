@@ -202,12 +202,10 @@ case "$1" in
                 '. + {$pid: {"npm": "@ai-sdk/openai-compatible", "name": ("Local " + $port), "options": {"baseURL": $url}, "models": $m}}')
         done
 
-        # 3. Create final config (without default model - let opencode use last used model)
+        # 3. Merge providers into existing config (preserve other settings)
         tmp=$(mktemp)
-        jq -n \
-            --argjson schema '{"$schema": "https://opencode.ai/config.json"}' \
-            --argjson providers "$providers_json" \
-            '$schema * {"provider": $providers}' > "$tmp" && mv "$tmp" "$OPENCIDE_CONFIG"
+        jq --argjson providers "$providers_json" \
+            '.provider = $providers' "$OPENCIDE_CONFIG" > "$tmp" && mv "$tmp" "$OPENCIDE_CONFIG"
 
         echo "Successfully synced to OpenCode config!"
         ;;
