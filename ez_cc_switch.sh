@@ -191,9 +191,8 @@ case "$1" in
                 model_url=$(jq -r ".models[\"$model_name\"].url" "$MODELS_FILE")
                 url_port=$(echo "$model_url" | sed 's|http://||' | cut -d':' -f2)
                 if [ "$url_port" = "$port" ]; then
-                    display_name=$(echo "$model_name" | sed 's|.*/||')
-                    models_json=$(echo "$models_json" | jq --arg m "$model_name" --arg n "$display_name" \
-                        '. + {$m: {"name": $n}}')
+                models_json=$(echo "$models_json" | jq --arg m "$model_name" --arg n "$model_name" \
+                    '. + {$m: {"name": $n}}')
                 fi
             done < <(jq -r '.models | keys[]' "$MODELS_FILE")
 
@@ -203,17 +202,12 @@ case "$1" in
                 '. + {$pid: {"npm": "@ai-sdk/openai-compatible", "name": ("Local " + $port), "options": {"baseURL": $url}, "models": $m}}')
         done
 
-        # Set default model to Big Pickle (opencode's built-in free model)
-        first_provider="opencode"
-        first_model="big-pickle"
-
-        # 3. Create final config
+        # 3. Create final config (without default model - let opencode use last used model)
         tmp=$(mktemp)
         jq -n \
             --argjson schema '{"$schema": "https://opencode.ai/config.json"}' \
-            --arg model "$first_provider/$first_model" \
             --argjson providers "$providers_json" \
-            '$schema * {"model": $model, "provider": $providers}' > "$tmp" && mv "$tmp" "$OPENCIDE_CONFIG"
+            '$schema * {"provider": $providers}' > "$tmp" && mv "$tmp" "$OPENCIDE_CONFIG"
 
         echo "Successfully synced to OpenCode config!"
         ;;
