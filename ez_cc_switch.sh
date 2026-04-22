@@ -3,6 +3,7 @@
 # Configuration
 MODELS_FILE="$HOME/.ez_cc_models.json"
 CLAUDE_CONFIG="$HOME/.claude.json"
+OPENCIDE_CONFIG="$HOME/.config/opencode/opencode.json"
 BACKUP_DIR="$HOME/.ez_cc_switch"
 MAX_BACKUPS=5
 
@@ -18,12 +19,13 @@ if [ ! -f "$MODELS_FILE" ]; then
 fi
 
 usage() {
-    echo "Usage: $0 {add|list|rm|edit|switch} [args]"
+    echo "Usage: $0 {add|list|rm|edit|switch|sync-opencode} [args]"
     echo "  add <<<modelmodelmodelmodel> <<<urlurlurlurl>     Add or update a model configuration"
     echo "  list                        List all saved models"
     echo "  rm <<<modelmodelmodelmodel>                   Remove a model configuration"
     echo "  edit <<<modelmodelmodelmodel> <<<urlurlurlurl>    Edit a model's URL"
     echo "  switch <<<modelmodelmodelmodel>               Switch Claude Code to the specified model"
+    echo "  sync-opencode                   Sync all models to OpenCode config (with backup)"
     exit 1
 }
 
@@ -37,6 +39,20 @@ backup_config() {
 
     # Rotate backups: keep only the most recent MAX_BACKUPS
     ls -t "$BACKUP_DIR"/.claude.json.* 2>/dev/null | tail -n +$((MAX_BACKUPS + 1)) | xargs -r rm
+}
+
+# Backup OpenCode config with rotation
+backup_opencode_config() {
+    mkdir -p "$BACKUP_DIR"
+    local timestamp=$(date +"%Y%m%d_%H%M%S")
+    local backup_file="$BACKUP_DIR/opencode.json.$timestamp"
+
+    if [ -f "$OPENCIDE_CONFIG" ]; then
+        cp "$OPENCIDE_CONFIG" "$backup_file"
+    fi
+
+    # Rotate backups: keep only the most recent MAX_BACKUPS
+    ls -t "$BACKUP_DIR"/opencode.json.* 2>/dev/null | tail -n +$((MAX_BACKUPS + 1)) | xargs -r rm
 }
 
 case "$1" in
@@ -136,6 +152,73 @@ case "$1" in
         echo "Successfully switched to '$model'!"
         echo "API Base: $api_base"
         echo "Model: $model"
+        ;;
+
+    sync-opencode)
+        if [ "$#" -ne 1 ]; then
+            echo "Usage: $0 sync-opencode"
+            exit 1
+        fi
+
+        # Check if models file exists and has models
+        model_count=$(jq '.models | length' "$MODELS_FILE")
+        if [ "$model_count" -eq 0 ]; then
+            echo "Error: No models found in library. Add models first with 'add' command."
+            exit 1
+        fi
+
+        echo "Syncing $model_count model(s) to OpenCode config..."
+
+        # 1. Backup current opencode config
+        backup_opencode_config
+
+        # 2. Group models by port
+        # Extract unique ports from urls
+        ports=$(jq -r '.models[].url' "$MODELS_FILE" | sed 's|http://||' | cut -d':' -f2 | sort -u)
+
+        # Build provider JSON
+        providers_json="{}"
+        first_model=""
+        first_provider=""
+
+        for port in $ports; do
+            provider_id="local-$port"
+            base_url="http://$(jq -r '.models[].url' "$MODELS_FILE" | grep ":$port" | head -1 | sed 's|http://||')"
+
+            # Get all models for this port
+            models_json="{}"
+            while IFS= read -r model_name; do
+                model_url=$(jq -r ".models[\"$model_name\"].url" "$MODELS_FILE")
+                url_port=$(echo "$model_url" | sed 's|http://||' | cut -d':' -f2)
+                if [ "$url_port" = "$port" ]; then
+                    display_name=$(echo "$model_name" | sed 's|.*/||')
+                    models_json=$(echo "$models_json" | jq --arg m "$model_name" --arg n "$display_name" \
+                        '. + {$m: {"name": $n}}')
+                fi
+            done < <(jq -r '.models | keys[]' "$MODELS_FILE")
+
+            # Build provider entry
+            providers_json=$(echo "$providers_json" | jq --arg pid "$provider_id" --arg port "$port" --arg url "$base_url/v1" \
+                --argjson m "$models_json" \
+                '. + {$pid: {"npm": "@ai-sdk/openai-compatible", "name": ("Local " + $port), "options": {"baseURL": $url}, "models": $m}}')
+
+            # Set first model/provider
+            if [ -z "$first_model" ]; then
+                first_model=$(echo "$models_json" | jq -r 'keys[0]')
+                first_provider="$provider_id"
+            fi
+        done
+
+        # 3. Create final config
+        tmp=$(mktemp)
+        jq -n \
+            --argjson schema '{"$schema": "https://opencode.ai/config.json"}' \
+            --arg model "$first_provider/$first_model" \
+            --argjson providers "$providers_json" \
+            '$schema * {"model": $model, "provider": $providers}' > "$tmp" && mv "$tmp" "$OPENCIDE_CONFIG"
+
+        echo "Successfully synced to OpenCode config!"
+        echo "Default model: $first_provider/$first_model"
         ;;
 
     *)
