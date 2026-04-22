@@ -201,13 +201,11 @@ case "$1" in
             providers_json=$(echo "$providers_json" | jq --arg pid "$provider_id" --arg port "$port" --arg url "$base_url/v1" \
                 --argjson m "$models_json" \
                 '. + {$pid: {"npm": "@ai-sdk/openai-compatible", "name": ("Local " + $port), "options": {"baseURL": $url}, "models": $m}}')
-
-            # Set first model/provider
-            if [ -z "$first_model" ]; then
-                first_model=$(echo "$models_json" | jq -r 'keys[0]')
-                first_provider="$provider_id"
-            fi
         done
+
+        # Set default model to Big Pickle (opencode's built-in free model)
+        first_provider="opencode"
+        first_model="big-pickle"
 
         # 3. Create final config
         tmp=$(mktemp)
@@ -218,7 +216,6 @@ case "$1" in
             '$schema * {"model": $model, "provider": $providers}' > "$tmp" && mv "$tmp" "$OPENCIDE_CONFIG"
 
         echo "Successfully synced to OpenCode config!"
-        echo "Default model: $first_provider/$first_model"
         ;;
 
     *)
