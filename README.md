@@ -45,6 +45,12 @@ sudo ./port_forward.sh add 8080 10.0.0.5 80
 
 This forwards TCP traffic received by the forwarding server on port `8080` to `10.0.0.5:80`. The script enables IPv4 forwarding when needed and tags its `iptables` rules so `list`, `remove`, and `flush` only operate on rules it manages.
 
+Lifecycle:
+
+The forwarding rules do not expire on their own and are not tied to the script process after `add` finishes. They remain active while the corresponding `iptables` rules and IPv4 forwarding setting remain in place.
+
+Forwarding is closed when you run `remove <local_port>` for that port, run `flush` for all rules managed by this script, manually delete or replace the related `iptables` rules, disable IPv4 forwarding, or when another firewall manager such as `ufw` or `firewalld` reloads and rewrites the rules. The rules added by this script are not persisted with `iptables-save`, `netfilter-persistent`, or a systemd startup unit, so they usually do not survive a system reboot unless the host has separate `iptables` persistence configured.
+
 ## check_port.sh
 
 Checks whether a TCP port is currently occupied by a listening process.
