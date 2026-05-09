@@ -45,6 +45,22 @@ sudo ./port_forward.sh add 8080 10.0.0.5 80
 
 This forwards TCP traffic received by the forwarding server on port `8080` to `10.0.0.5:80`. The script enables IPv4 forwarding when needed and tags its `iptables` rules so `list`, `remove`, and `flush` only operate on rules it manages.
 
+## check_port.sh
+
+Checks whether a TCP port is currently occupied by a listening process.
+
+```bash
+./check_port.sh <port>
+```
+
+Example:
+
+```bash
+./check_port.sh 8080
+```
+
+The script validates that the port is between `1` and `65535`, then reports whether it is available or in use. It uses `lsof`, `ss`, or `netstat`, depending on which command is available on the system.
+
 ## hf_mirror_download.sh
 
 Downloads a Hugging Face model, dataset, or space through a mirror endpoint. Defaults to `https://hf-mirror.com`.
