@@ -45,6 +45,28 @@ sudo ./port_forward.sh add 8080 10.0.0.5 80
 
 This forwards TCP traffic received by the forwarding server on port `8080` to `10.0.0.5:80`. The script enables IPv4 forwarding when needed and tags its `iptables` rules so `list`, `remove`, and `flush` only operate on rules it manages.
 
+## hf_mirror_download.sh
+
+Downloads a Hugging Face model, dataset, or space through a mirror endpoint. Defaults to `https://hf-mirror.com`.
+
+```bash
+./hf_mirror_download.sh [options] <repo_id>
+```
+
+Examples:
+
+```bash
+./hf_mirror_download.sh Qwen/Qwen2.5-7B-Instruct
+./hf_mirror_download.sh -o ./models/qwen -r main Qwen/Qwen2.5-7B-Instruct
+./hf_mirror_download.sh --include '*.safetensors' --include '*.json' meta-llama/Llama-3.1-8B
+```
+
+Requires `huggingface-cli`:
+
+```bash
+python3 -m pip install -U huggingface_hub
+```
+
 ## ez_cc_switch.sh
 
 Manages model configurations for Claude Code and OpenCode.
