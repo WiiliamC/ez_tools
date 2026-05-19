@@ -115,3 +115,24 @@ Installs an AppArmor profile for the Codex native binary on Ubuntu/Debian-like s
 Useful when Codex fails to start or run commands because unprivileged user namespaces are restricted by AppArmor. The script locates the installed Codex native binary, writes `/etc/apparmor.d/codex-native`, reloads the profile, and prints the current user namespace settings.
 
 Requires `sudo` when not run as root. Restart Codex after running the script.
+
+## kernel_auto_upgrade.sh
+
+Manages kernel package auto-upgrades through Ubuntu/Debian `apt` and `unattended-upgrades` configuration.
+
+```bash
+./kernel_auto_upgrade.sh status
+./kernel_auto_upgrade.sh disable
+./kernel_auto_upgrade.sh enable
+./kernel_auto_upgrade.sh help
+```
+
+`disable` writes `/etc/apt/apt.conf.d/52-disable-kernel-auto-upgrades` with:
+
+```aptconf
+Unattended-Upgrade::Package-Blacklist { "linux-"; };
+```
+
+This blocks unattended upgrades for packages matching `linux-` without disabling the system's overall security updates. `enable` removes only that managed file and leaves any other user-managed APT configuration unchanged. `status` reports whether the effective `Unattended-Upgrade::Package-Blacklist` contains `linux-`, and whether it was detected in the managed file or in non-managed APT configuration.
+
+Requires `sudo` for `disable` and `enable` when not run as root.
