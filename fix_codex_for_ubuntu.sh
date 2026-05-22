@@ -32,9 +32,30 @@ resolve_codex_entrypoint() {
   readlink -f "${codex_path}"
 }
 
+find_codex_native_binary_under() {
+  local roots=("$@")
+  local native_path
+
+  [[ "${#roots[@]}" -gt 0 ]] || return
+
+  native_path="$(find "${roots[@]}" -path '*/@openai/codex-linux-*/vendor/*/bin/codex' -type f -perm -111 2>/dev/null | head -n 1 || true)"
+  if [[ -n "${native_path}" ]]; then
+    printf '%s\n' "${native_path}"
+    return
+  fi
+
+  find "${roots[@]}" -path '*/@openai/codex-linux-*/vendor/*/codex/codex' -type f -perm -111 2>/dev/null | head -n 1 || true
+}
+
 resolve_codex_native_binary() {
   local entrypoint="$1"
   local node_dir native_path
+  local -a global_roots
+
+  if [[ -x "${entrypoint}" && "$(basename "${entrypoint}")" == "codex" && "${entrypoint}" == */vendor/*/bin/codex ]]; then
+    printf '%s\n' "${entrypoint}"
+    return
+  fi
 
   if [[ -x "${entrypoint}" && "$(basename "${entrypoint}")" == "codex" && "${entrypoint}" == */vendor/*/codex/codex ]]; then
     printf '%s\n' "${entrypoint}"
@@ -44,7 +65,7 @@ resolve_codex_native_binary() {
   node_dir="$(dirname "${entrypoint}")"
 
   while [[ "${node_dir}" != "/" ]]; do
-    native_path="$(find "${node_dir}" -path '*/@openai/codex-linux-*/vendor/*/codex/codex' -type f -perm -111 2>/dev/null | head -n 1 || true)"
+    native_path="$(find_codex_native_binary_under "${node_dir}")"
     if [[ -n "${native_path}" ]]; then
       readlink -f "${native_path}"
       return
@@ -52,9 +73,20 @@ resolve_codex_native_binary() {
     node_dir="$(dirname "${node_dir}")"
   done
 
-  native_path="$(find /usr/local/lib/node_modules/@openai/codex /usr/lib/node_modules/@openai/codex \
-    -path '*/@openai/codex-linux-*/vendor/*/codex/codex' -type f -perm -111 2>/dev/null | head -n 1 || true)"
-  [[ -n "${native_path}" ]] || die "could not locate Codex native binary under the global npm install"
+  global_roots=()
+  if command -v npm >/dev/null 2>&1; then
+    native_path="$(npm root -g 2>/dev/null || true)"
+    if [[ -n "${native_path}" ]]; then
+      global_roots+=("${native_path}/@openai/codex")
+    fi
+  fi
+  global_roots+=(
+    /usr/local/lib/node_modules/@openai/codex
+    /usr/lib/node_modules/@openai/codex
+  )
+
+  native_path="$(find_codex_native_binary_under "${global_roots[@]}")"
+  [[ -n "${native_path}" ]] || die "could not locate Codex native binary under the global npm install; checked both new vendor/*/bin/codex and old vendor/*/codex/codex layouts"
   readlink -f "${native_path}"
 }
 
