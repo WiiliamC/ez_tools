@@ -26,6 +26,30 @@ The last argument is treated as the log file path. For shell syntax such as pipe
 ./run_in_backend.sh bash -lc 'npm run dev | cat' /tmp/dev.log
 ```
 
+## daily_task.sh
+
+Manages daily cron tasks for the current user.
+
+```bash
+./daily_task.sh add <task_name> <HH:MM> <command> [args...]
+./daily_task.sh delete <task_name>
+./daily_task.sh list
+./daily_task.sh -h
+```
+
+Examples:
+
+```bash
+./daily_task.sh add backup 02:30 /usr/local/bin/backup --full
+./daily_task.sh add shell_job 18:15 bash -lc 'date >> ~/daily.txt && echo done'
+./daily_task.sh list
+./daily_task.sh delete backup
+```
+
+Task names may contain only letters, digits, underscore, dot, and hyphen. Times use 24-hour `HH:MM` format from `00:00` through `23:59`. Commands are stored as argument arrays, so shell syntax is interpreted only when you explicitly run a shell such as `bash -lc '...'`.
+
+The script tags its crontab entries with clear markers and only modifies those managed entries. Logs are appended under `~/.daily_task/logs/{task}/{YYYY-MM-DD}.log`.
+
 ## port_forward.sh
 
 Manages TCP port forwarding rules on Linux with `iptables` DNAT/MASQUERADE.
