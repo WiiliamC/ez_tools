@@ -73,6 +73,13 @@ assert_file_not_contains() {
 output="$("${script}" list)"
 assert_contains "${output}" "No managed daily tasks"
 
+output="$("${script}" --help)"
+assert_contains "${output}" "~/.daily_task/logs/{task}/{YYYY-MM-DD}.log"
+assert_contains "${output}" "[daily_task]"
+assert_contains "${output}" "Command stdout and stderr"
+assert_contains "${output}" "~/.daily_task/locks"
+assert_contains "${output}" "previous-run-active"
+
 "${script}" add report.job 09:07 printf 'hello %s\n' world
 
 assert_file_contains "${FAKE_CRONTAB_FILE}" "# daily_task: begin report.job"
@@ -145,6 +152,73 @@ assert_contains "${output}" "${work_dir}/bin/job.sh parent-arg"
 relative_log_file="${HOME}/.daily_task/logs/relative.dot/$(date +%F).log"
 assert_file_contains "${relative_log_file}" "mark:./scripts/not-command.sh:../arg"
 
+if ! command -v flock >/dev/null 2>&1; then
+  echo "Test requires flock to verify generated wrapper locking behavior" >&2
+  exit 1
+fi
+
+slow_marker="${tmp_dir}/slow.started"
+"${script}" add slow.task 10:16 bash -lc "printf 'slow-out\n'; touch '${slow_marker}'; sleep 2"
+"${script}" add other.task 10:17 printf 'other-out\n'
+slow_wrapper="${HOME}/.daily_task/wrappers/slow.task.sh"
+"${slow_wrapper}" &
+slow_pid=$!
+for _ in {1..50}; do
+  [[ -f "${slow_marker}" ]] && break
+  sleep 0.1
+done
+if [[ ! -f "${slow_marker}" ]]; then
+  echo "Slow task did not start" >&2
+  wait "${slow_pid}" || true
+  exit 1
+fi
+
+set +e
+"${slow_wrapper}"
+slow_conflict_status=$?
+set -e
+if [[ "${slow_conflict_status}" -ne 75 ]]; then
+  echo "Expected overlapping same task to exit 75, got ${slow_conflict_status}" >&2
+  wait "${slow_pid}" || true
+  exit 1
+fi
+
+set +e
+"${HOME}/.daily_task/wrappers/other.task.sh"
+other_status=$?
+set -e
+if [[ "${other_status}" -ne 0 ]]; then
+  echo "Expected different task to run while slow task was active, got ${other_status}" >&2
+  wait "${slow_pid}" || true
+  exit 1
+fi
+other_log_file="${HOME}/.daily_task/logs/other.task/$(date +%F).log"
+assert_file_contains "${other_log_file}" "other-out"
+
+wait "${slow_pid}"
+slow_log_file="${HOME}/.daily_task/logs/slow.task/$(date +%F).log"
+assert_file_contains "${slow_log_file}" "[daily_task]"
+assert_file_contains "${slow_log_file}" "starting:"
+assert_file_contains "${slow_log_file}" "previous-run-active"
+assert_file_contains "${slow_log_file}" "exit: 75"
+assert_file_contains "${slow_log_file}" "slow-out"
+assert_file_not_contains "${slow_log_file}" "[daily_task] slow-out"
+
+"${script}" add background.child 10:19 bash -lc "sleep 2 & printf 'bg-parent-done\n'"
+background_wrapper="${HOME}/.daily_task/wrappers/background.child.sh"
+"${background_wrapper}"
+set +e
+"${background_wrapper}"
+background_status=$?
+set -e
+if [[ "${background_status}" -ne 0 ]]; then
+  echo "Expected task to rerun after parent command exited, got ${background_status}" >&2
+  exit 1
+fi
+background_log_file="${HOME}/.daily_task/logs/background.child/$(date +%F).log"
+assert_file_contains "${background_log_file}" "bg-parent-done"
+assert_file_not_contains "${background_log_file}" "previous-run-active"
+
 mv "${wrapper}" "${wrapper}.missing"
 output="$("${script}" list)"
 assert_contains "${output}" "report.job"
@@ -174,6 +248,22 @@ if "${script}" add valid 24:00 echo bad >/tmp/daily_task_bad_time.out 2>&1; then
   exit 1
 fi
 
+no_flock_bin="${tmp_dir}/no-flock-bin"
+mkdir -p "${no_flock_bin}"
+for required in env bash dirname pwd mktemp grep rm awk cp chmod mv mkdir cat; do
+  required_path="$(command -v "${required}")"
+  ln -s "${required_path}" "${no_flock_bin}/${required}"
+done
+if PATH="${no_flock_bin}" "${script}" add no.flock 10:18 echo bad >"${tmp_dir}/no-flock.out" 2>&1; then
+  echo "Add unexpectedly succeeded without flock" >&2
+  exit 1
+fi
+assert_file_contains "${tmp_dir}/no-flock.out" "missing required command: flock"
+if [[ -e "${HOME}/.daily_task/wrappers/no.flock.sh" ]]; then
+  echo "Wrapper was installed even though flock is unavailable" >&2
+  exit 1
+fi
+
 cron_home="${tmp_dir}/cron-home"
 mkdir -p "${cron_home}"
 HOME="${cron_home}" "${wrapper}"
@@ -181,6 +271,10 @@ today="$(date +%F)"
 log_file="${HOME}/.daily_task/logs/report.job/${today}.log"
 cron_log_file="${cron_home}/.daily_task/logs/report.job/${today}.log"
 assert_file_contains "${log_file}" "hello world"
+assert_file_contains "${log_file}" "[daily_task]"
+assert_file_contains "${log_file}" "starting:"
+assert_file_contains "${log_file}" "exit: 0"
+assert_file_not_contains "${log_file}" "[daily_task] hello world"
 [[ ! -e "${cron_log_file}" ]]
 
 delete_home="${tmp_dir}/delete-home"

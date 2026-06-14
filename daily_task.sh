@@ -6,6 +6,7 @@ TAG="[daily-task]"
 STATE_DIR="${HOME}/.daily_task"
 WRAPPER_DIR="${STATE_DIR}/wrappers"
 LOG_DIR="${STATE_DIR}/logs"
+LOCK_DIR="${STATE_DIR}/locks"
 MARKER_PREFIX="# daily_task:"
 
 usage() {
@@ -40,7 +41,16 @@ Examples:
   ./daily_task.sh delete backup
 
 Logs:
-  Output is appended to ~/.daily_task/logs/{task}/{YYYY-MM-DD}.log
+  Wrapper records and command output share one log file:
+    ~/.daily_task/logs/{task}/{YYYY-MM-DD}.log
+  Wrapper-owned records are prefixed with [daily_task]. Command stdout and stderr
+  are appended unchanged.
+
+Non-overlap:
+  Each generated wrapper uses a per-task nonblocking flock under
+  ~/.daily_task/locks. If the same task is still running, the later run logs a
+  [daily_task] skipped previous-run-active record, logs exit status 75, and
+  exits 75. Different task names use different locks and do not block each other.
 
 Notes:
   This utility edits only crontab entries between its own clear markers and leaves
@@ -59,6 +69,10 @@ die() {
 
 need_crontab() {
   command -v crontab >/dev/null 2>&1 || die "missing required command: crontab"
+}
+
+need_flock() {
+  command -v flock >/dev/null 2>&1 || die "missing required command: flock"
 }
 
 validate_task_name() {
@@ -212,7 +226,7 @@ write_wrapper() {
   local wrapper
   local tmp_wrapper
 
-  mkdir -p -- "${WRAPPER_DIR}" "${LOG_DIR}/${task_name}"
+  mkdir -p -- "${WRAPPER_DIR}" "${LOG_DIR}/${task_name}" "${LOCK_DIR}"
   cmd_display="$(quote_args "$@")"
   wrapper="${WRAPPER_DIR}/${task_name}.sh"
   tmp_wrapper="$(mktemp "${WRAPPER_DIR}/.${task_name}.XXXXXX")"
@@ -222,18 +236,42 @@ write_wrapper() {
     printf 'set -euo pipefail\n\n'
     printf 'task_name=%q\n' "${task_name}"
     printf 'log_dir=%q\n' "${LOG_DIR}/${task_name}"
-    printf 'mkdir -p -- "${log_dir}"\n'
+    printf 'lock_dir=%q\n' "${LOCK_DIR}"
+    printf 'mkdir -p -- "${log_dir}" "${lock_dir}"\n'
     printf 'log_file="${log_dir}/$(date +%%F).log"\n'
+    printf 'lock_file="${lock_dir}/${task_name}.lock"\n'
+    printf 'lock_acquired_marker="${log_dir}/.lock-acquired.$$"\n'
     printf 'cmd=(%s)\n\n' "${cmd_display}"
-    printf '{\n'
-    printf '  printf '"'"'[%%s] starting: %%s\\n'"'"' "$(date '"'"'+%%F %%T%%z'"'"')" "${cmd[*]}"\n'
-    printf '  set +e\n'
-    printf '  "${cmd[@]}"\n'
-    printf '  status=$?\n'
-    printf '  set -e\n'
-    printf '  printf '"'"'[%%s] exit: %%s\\n'"'"' "$(date '"'"'+%%F %%T%%z'"'"')" "${status}"\n'
-    printf '  exit "${status}"\n'
-    printf '} >>"${log_file}" 2>&1\n'
+    printf 'rm -f -- "${lock_acquired_marker}"\n'
+    printf 'set +e\n'
+    printf 'flock -n -E 75 --close "${lock_file}" bash -c '"'"'\n'
+    printf '  set -euo pipefail\n'
+    printf '  lock_acquired_marker="$1"\n'
+    printf '  log_file="$2"\n'
+    printf '  shift 2\n'
+    printf '  touch -- "${lock_acquired_marker}"\n'
+    printf '  {\n'
+    printf '    printf '"'"'"'"'"'"'"'"'[daily_task] [%%s] starting: %%s\\n'"'"'"'"'"'"'"'"' "$(date '"'"'"'"'"'"'"'"'+%%F %%T%%z'"'"'"'"'"'"'"'"')" "$*"\n'
+    printf '    set +e\n'
+    printf '    "$@"\n'
+    printf '    status=$?\n'
+    printf '    set -e\n'
+    printf '    printf '"'"'"'"'"'"'"'"'[daily_task] [%%s] exit: %%s\\n'"'"'"'"'"'"'"'"' "$(date '"'"'"'"'"'"'"'"'+%%F %%T%%z'"'"'"'"'"'"'"'"')" "${status}"\n'
+    printf '    exit "${status}"\n'
+    printf '  } >>"${log_file}" 2>&1\n'
+    printf ''"'"' daily_task-wrapper "${lock_acquired_marker}" "${log_file}" "${cmd[@]}"\n'
+    printf 'status=$?\n'
+    printf 'set -e\n'
+    printf 'if [[ "${status}" -eq 75 && ! -e "${lock_acquired_marker}" ]]; then\n'
+    printf '  {\n'
+    printf '    printf '"'"'[daily_task] [%%s] skipped: previous-run-active\\n'"'"' "$(date '"'"'+%%F %%T%%z'"'"')"\n'
+    printf '    printf '"'"'[daily_task] [%%s] exit: 75\\n'"'"' "$(date '"'"'+%%F %%T%%z'"'"')"\n'
+    printf '  } >>"${log_file}" 2>&1\n'
+    printf '  rm -f -- "${lock_acquired_marker}"\n'
+    printf '  exit 75\n'
+    printf 'fi\n\n'
+    printf 'rm -f -- "${lock_acquired_marker}"\n'
+    printf 'exit "${status}"\n'
   } >"${tmp_wrapper}"
 
   chmod 700 "${tmp_wrapper}"
@@ -257,6 +295,7 @@ add_task() {
 
   validate_task_name "${task_name}"
   validate_time "${time}"
+  need_flock
 
   command_path="$(normalize_command_path "$1")"
   shift
