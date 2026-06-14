@@ -88,6 +88,31 @@ quote_args() {
   done
 }
 
+resolve_relative_command_path() {
+  local command_path="$1"
+  local command_dir="${command_path%/*}"
+  local command_name="${command_path##*/}"
+  local resolved_dir
+
+  if resolved_dir="$(unset CDPATH; cd -- "${command_dir}" 2>/dev/null && pwd -P)"; then
+    printf '%s/%s' "${resolved_dir}" "${command_name}"
+    return
+  fi
+
+  printf '%s/%s' "$(pwd -P)" "${command_path}"
+}
+
+normalize_command_path() {
+  local command_path="$1"
+
+  if [[ "${command_path}" == */* && "${command_path}" != /* ]]; then
+    resolve_relative_command_path "${command_path}"
+    return
+  fi
+
+  printf '%s' "${command_path}"
+}
+
 read_current_crontab_to() {
   local output_file="$1"
   local err_file
@@ -227,9 +252,15 @@ add_task() {
   local cmd_display
   local current
   local updated
+  local command_path
+  local -a command_args
 
   validate_task_name "${task_name}"
   validate_time "${time}"
+
+  command_path="$(normalize_command_path "$1")"
+  shift
+  command_args=("${command_path}" "$@")
 
   current="$(mktemp)"
   updated="$(mktemp)"
@@ -240,10 +271,10 @@ add_task() {
     die "task '${task_name}' already exists; delete it before adding a replacement"
   fi
 
-  write_wrapper "${task_name}" "$@"
+  write_wrapper "${task_name}" "${command_args[@]}"
 
   wrapper="${WRAPPER_DIR}/${task_name}.sh"
-  cmd_display="$(quote_args "$@")"
+  cmd_display="$(quote_args "${command_args[@]}")"
   cp "${current}" "${updated}"
   {
     [[ ! -s "${updated}" ]] || printf '\n'

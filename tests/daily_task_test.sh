@@ -59,6 +59,17 @@ assert_file_contains() {
   fi
 }
 
+assert_file_not_contains() {
+  local file="$1"
+  local needle="$2"
+
+  if grep -Fq -- "${needle}" "${file}"; then
+    printf 'Expected %s not to contain: %s\nActual contents:\n' "${file}" "${needle}" >&2
+    cat "${file}" >&2
+    exit 1
+  fi
+}
+
 output="$("${script}" list)"
 assert_contains "${output}" "No managed daily tasks"
 
@@ -80,6 +91,59 @@ assert_contains "${output}" "09:07"
 assert_contains "${output}" "ok"
 assert_contains "${output}" "printf"
 assert_contains "${output}" "hello\\ %s\\\\n"
+
+work_dir="${tmp_dir}/work"
+cdpath_dir="${tmp_dir}/cdpath"
+mkdir -p "${work_dir}/scripts" "${work_dir}/bin" "${work_dir}/nested" "${cdpath_dir}/scripts"
+printf '#!/usr/bin/env bash\nprintf "mark:%%s:%%s\\n" "$1" "$2"\n' >"${work_dir}/scripts/mark.sh"
+printf '#!/usr/bin/env bash\nprintf "job:%%s\\n" "$1"\n' >"${work_dir}/scripts/job.sh"
+printf '#!/usr/bin/env bash\nprintf "parent-job:%%s\\n" "$1"\n' >"${work_dir}/bin/job.sh"
+printf '#!/usr/bin/env bash\nprintf "cdpath-job:%%s\\n" "$1"\n' >"${cdpath_dir}/scripts/job.sh"
+chmod +x "${work_dir}/scripts/mark.sh" "${work_dir}/scripts/job.sh" "${work_dir}/bin/job.sh"
+
+(
+  cd "${work_dir}"
+  "${script}" add relative.dot 10:11 ./scripts/mark.sh './scripts/not-command.sh' '../arg'
+  CDPATH="${cdpath_dir}" "${script}" add relative.plain 10:12 scripts/job.sh plain-arg
+  "${script}" add absolute.cmd 10:13 "${work_dir}/scripts/job.sh" absolute-arg
+  "${script}" add path.cmd 10:14 bash -lc 'printf path-command'
+)
+(
+  cd "${work_dir}/nested"
+  "${script}" add relative.parent 10:15 ../bin/job.sh parent-arg
+)
+
+assert_file_contains "${FAKE_CRONTAB_FILE}" "# daily_task: command ${work_dir}/scripts/mark.sh ./scripts/not-command.sh ../arg"
+assert_file_contains "${FAKE_CRONTAB_FILE}" "# daily_task: command ${work_dir}/scripts/job.sh plain-arg"
+assert_file_contains "${FAKE_CRONTAB_FILE}" "# daily_task: command ${work_dir}/scripts/job.sh absolute-arg"
+assert_file_contains "${FAKE_CRONTAB_FILE}" "# daily_task: command bash -lc printf\\ path-command"
+assert_file_contains "${FAKE_CRONTAB_FILE}" "# daily_task: command ${work_dir}/bin/job.sh parent-arg"
+assert_file_not_contains "${FAKE_CRONTAB_FILE}" "# daily_task: command ./scripts/mark.sh"
+assert_file_not_contains "${FAKE_CRONTAB_FILE}" "# daily_task: command scripts/job.sh plain-arg"
+assert_file_not_contains "${FAKE_CRONTAB_FILE}" "# daily_task: command ../bin/job.sh"
+assert_file_not_contains "${FAKE_CRONTAB_FILE}" "${cdpath_dir}/scripts/job.sh"
+
+relative_wrapper="${HOME}/.daily_task/wrappers/relative.dot.sh"
+assert_file_contains "${relative_wrapper}" "cmd=(${work_dir}/scripts/mark.sh ./scripts/not-command.sh ../arg)"
+
+output="$("${script}" list)"
+assert_contains "${output}" "relative.dot"
+assert_contains "${output}" "${work_dir}/scripts/mark.sh ./scripts/not-command.sh ../arg"
+assert_contains "${output}" "relative.plain"
+assert_contains "${output}" "${work_dir}/scripts/job.sh plain-arg"
+assert_contains "${output}" "absolute.cmd"
+assert_contains "${output}" "${work_dir}/scripts/job.sh absolute-arg"
+assert_contains "${output}" "path.cmd"
+assert_contains "${output}" "bash -lc printf\\ path-command"
+assert_contains "${output}" "relative.parent"
+assert_contains "${output}" "${work_dir}/bin/job.sh parent-arg"
+
+(
+  cd "${tmp_dir}"
+  HOME="${tmp_dir}/cron-relative-home" "${relative_wrapper}"
+)
+relative_log_file="${HOME}/.daily_task/logs/relative.dot/$(date +%F).log"
+assert_file_contains "${relative_log_file}" "mark:./scripts/not-command.sh:../arg"
 
 mv "${wrapper}" "${wrapper}.missing"
 output="$("${script}" list)"
