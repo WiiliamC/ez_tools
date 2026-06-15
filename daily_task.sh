@@ -32,6 +32,8 @@ Time format:
 Command behavior:
   Commands use argument-array semantics. The command and each argument are preserved
   as separate arguments; shell syntax is not interpreted unless you explicitly run a shell.
+  Tasks run from the add-time working directory. Relative command paths and
+  relative arguments are resolved by the command from that directory at run time.
 
 Examples:
   ./daily_task.sh add backup 02:30 /usr/local/bin/backup --full
@@ -100,31 +102,6 @@ quote_args() {
   for arg in "$@"; do
     printf ' %q' "${arg}"
   done
-}
-
-resolve_relative_command_path() {
-  local command_path="$1"
-  local command_dir="${command_path%/*}"
-  local command_name="${command_path##*/}"
-  local resolved_dir
-
-  if resolved_dir="$(unset CDPATH; cd -- "${command_dir}" 2>/dev/null && pwd -P)"; then
-    printf '%s/%s' "${resolved_dir}" "${command_name}"
-    return
-  fi
-
-  printf '%s/%s' "$(pwd -P)" "${command_path}"
-}
-
-normalize_command_path() {
-  local command_path="$1"
-
-  if [[ "${command_path}" == */* && "${command_path}" != /* ]]; then
-    resolve_relative_command_path "${command_path}"
-    return
-  fi
-
-  printf '%s' "${command_path}"
 }
 
 read_current_crontab_to() {
@@ -221,7 +198,8 @@ task_wrapper_in() {
 
 write_wrapper() {
   local task_name="$1"
-  shift
+  local work_dir="$2"
+  shift 2
   local cmd_display
   local wrapper
   local tmp_wrapper
@@ -235,6 +213,7 @@ write_wrapper() {
     printf '#!/usr/bin/env bash\n\n'
     printf 'set -euo pipefail\n\n'
     printf 'task_name=%q\n' "${task_name}"
+    printf 'work_dir=%q\n' "${work_dir}"
     printf 'log_dir=%q\n' "${LOG_DIR}/${task_name}"
     printf 'lock_dir=%q\n' "${LOCK_DIR}"
     printf 'mkdir -p -- "${log_dir}" "${lock_dir}"\n'
@@ -248,18 +227,23 @@ write_wrapper() {
     printf '  set -euo pipefail\n'
     printf '  lock_acquired_marker="$1"\n'
     printf '  log_file="$2"\n'
-    printf '  shift 2\n'
+    printf '  work_dir="$3"\n'
+    printf '  shift 3\n'
     printf '  touch -- "${lock_acquired_marker}"\n'
     printf '  {\n'
     printf '    printf '"'"'"'"'"'"'"'"'[daily_task] [%%s] starting: %%s\\n'"'"'"'"'"'"'"'"' "$(date '"'"'"'"'"'"'"'"'+%%F %%T%%z'"'"'"'"'"'"'"'"')" "$*"\n'
     printf '    set +e\n'
-    printf '    "$@"\n'
+    printf '    cd -- "${work_dir}"\n'
     printf '    status=$?\n'
+    printf '    if [[ "${status}" -eq 0 ]]; then\n'
+    printf '      "$@"\n'
+    printf '      status=$?\n'
+    printf '    fi\n'
     printf '    set -e\n'
     printf '    printf '"'"'"'"'"'"'"'"'[daily_task] [%%s] exit: %%s\\n'"'"'"'"'"'"'"'"' "$(date '"'"'"'"'"'"'"'"'+%%F %%T%%z'"'"'"'"'"'"'"'"')" "${status}"\n'
     printf '    exit "${status}"\n'
     printf '  } >>"${log_file}" 2>&1\n'
-    printf ''"'"' daily_task-wrapper "${lock_acquired_marker}" "${log_file}" "${cmd[@]}"\n'
+    printf ''"'"' daily_task-wrapper "${lock_acquired_marker}" "${log_file}" "${work_dir}" "${cmd[@]}"\n'
     printf 'status=$?\n'
     printf 'set -e\n'
     printf 'if [[ "${status}" -eq 75 && ! -e "${lock_acquired_marker}" ]]; then\n'
@@ -290,16 +274,15 @@ add_task() {
   local cmd_display
   local current
   local updated
-  local command_path
+  local work_dir
   local -a command_args
 
   validate_task_name "${task_name}"
   validate_time "${time}"
   need_flock
 
-  command_path="$(normalize_command_path "$1")"
-  shift
-  command_args=("${command_path}" "$@")
+  work_dir="$(pwd -P)"
+  command_args=("$@")
 
   current="$(mktemp)"
   updated="$(mktemp)"
@@ -310,7 +293,7 @@ add_task() {
     die "task '${task_name}' already exists; delete it before adding a replacement"
   fi
 
-  write_wrapper "${task_name}" "${command_args[@]}"
+  write_wrapper "${task_name}" "${work_dir}" "${command_args[@]}"
 
   wrapper="${WRAPPER_DIR}/${task_name}.sh"
   cmd_display="$(quote_args "${command_args[@]}")"
@@ -319,6 +302,7 @@ add_task() {
     [[ ! -s "${updated}" ]] || printf '\n'
     printf '%s begin %s\n' "${MARKER_PREFIX}" "${task_name}"
     printf '%s time %s\n' "${MARKER_PREFIX}" "${time}"
+    printf '%s workdir %s\n' "${MARKER_PREFIX}" "${work_dir}"
     printf '%s command %s\n' "${MARKER_PREFIX}" "${cmd_display}"
     printf '%s wrapper %s\n' "${MARKER_PREFIX}" "${wrapper}"
     printf '%d %d * * * %q\n' "$((10#${minute}))" "$((10#${hour}))" "${wrapper}"
