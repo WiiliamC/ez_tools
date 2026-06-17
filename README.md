@@ -91,6 +91,22 @@ Example:
 
 The script validates that the port is between `1` and `65535`, then reports whether it is available or in use. It uses `lsof`, `ss`, or `netstat`, depending on which command is available on the system.
 
+## kill_process.sh
+
+Finds processes whose full command line contains a keyword, shows the matching process information, and asks for confirmation before sending `TERM`.
+
+```bash
+./kill_process.sh <process_command_keyword>
+```
+
+Example:
+
+```bash
+./kill_process.sh "python -m service"
+```
+
+The script excludes its own process and ancestor shell/wrapper processes from matches. If no processes match, it prints a clear message and exits successfully. Only `y` or `yes` confirms termination.
+
 ## hf_mirror_download.sh
 
 Downloads a Hugging Face model, dataset, or space through a mirror endpoint. Defaults to `https://hf-mirror.com`.
