@@ -78,9 +78,42 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 try:
-    review = json.loads(path.read_text())
+    raw = path.read_text(encoding="utf-8")
 except Exception as exc:
-    print(f"Could not parse review JSON: {exc}", file=sys.stderr)
+    print(f"Could not read review JSON from {path}: {exc}", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    review = json.loads(raw)
+except Exception as exc:
+    print(f"Could not parse review JSON from {path}: {exc}", file=sys.stderr)
+    print(f"Raw review JSON size: {len(raw.encode('utf-8'))} bytes", file=sys.stderr)
+    if raw:
+        print("--- Raw review JSON preview ---", file=sys.stderr)
+        print(raw[:4000], file=sys.stderr)
+        if len(raw) > 4000:
+            print("--- Raw review JSON preview truncated ---", file=sys.stderr)
+    else:
+        print("Raw review JSON is empty.", file=sys.stderr)
+    sys.exit(2)
+
+schema_errors = []
+if not isinstance(review, dict):
+    schema_errors.append("top-level value is not an object")
+else:
+    if not isinstance(review.get("satisfied"), bool):
+        schema_errors.append("satisfied must be a boolean")
+    if not isinstance(review.get("summary"), str):
+        schema_errors.append("summary must be a string")
+    if not isinstance(review.get("findings"), list):
+        schema_errors.append("findings must be an array")
+
+if schema_errors:
+    print(f"Review JSON from {path} does not match expected schema: {', '.join(schema_errors)}", file=sys.stderr)
+    print("--- Raw review JSON ---", file=sys.stderr)
+    print(raw[:4000], file=sys.stderr)
+    if len(raw) > 4000:
+        print("--- Raw review JSON truncated ---", file=sys.stderr)
     sys.exit(2)
 
 satisfied = review.get("satisfied") is True
@@ -171,6 +204,17 @@ cat > "$schema_file" <<'JSON'
 }
 JSON
 
+review_prompt='Review the current uncommitted changes in this repository. Inspect git status, staged and unstaged diffs, and relevant untracked files before deciding.
+
+Return a structured final JSON message that matches the provided output schema:
+{
+  "satisfied": boolean,
+  "summary": string,
+  "findings": array
+}
+
+Set satisfied to true only when the review finds no remaining issues. When unsatisfied, include concise, actionable findings.'
+
 cleanup() {
     rm -rf "$tmp_dir"
 }
@@ -180,7 +224,7 @@ trap cleanup EXIT
     echo "Review/fix loop started at ${exec_datetime}"
     echo "Project root: ${project_root}"
     echo "Max loops: ${max_loops}"
-    echo "Review command: codex exec review --uncommitted"
+    echo "Review command: codex exec --sandbox read-only --output-schema ${schema_file} --output-last-message ${review_json} <review prompt>"
     echo ""
 } >> "$log_file"
 
@@ -195,8 +239,8 @@ for ((loop = 1; loop <= max_loops; loop++)); do
 
     if (
         cd "$project_root"
-        codex exec review --uncommitted --output-schema "$schema_file"
-    ) > "$review_json" 2>> "$log_file"; then
+        codex exec --sandbox read-only --output-schema "$schema_file" --output-last-message "$review_json" "$review_prompt"
+    ) >> "$log_file" 2>&1; then
         :
     else
         status=$?
@@ -210,7 +254,12 @@ for ((loop = 1; loop <= max_loops; loop++)); do
 
     {
         echo "--- Structured review JSON ---"
-        cat "$review_json"
+        echo "Path: ${review_json}"
+        if [ -f "$review_json" ]; then
+            cat "$review_json"
+        else
+            echo "(review JSON file missing)"
+        fi
         echo ""
     } >> "$log_file"
 
