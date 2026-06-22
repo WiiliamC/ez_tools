@@ -156,6 +156,21 @@ Useful when Codex fails to start or run commands because unprivileged user names
 
 Requires `sudo` when not run as root. Restart Codex after running the script.
 
+## config_earlyoom.sh
+
+Installs and enables `earlyoom` on Ubuntu/Debian APT systems using the package defaults.
+
+```bash
+./config_earlyoom.sh
+./config_earlyoom.sh install
+./config_earlyoom.sh status
+./config_earlyoom.sh help
+```
+
+`install` runs `apt-get update`, installs the `earlyoom` package, and enables/starts `earlyoom.service` through `systemctl`. It does not write `/etc/default/earlyoom` or systemd overrides, so the distribution package's default configuration remains active.
+
+Requires `sudo` when not run as root.
+
 ## kernel_auto_upgrade.sh
 
 Manages kernel package auto-upgrades through Ubuntu/Debian `apt` and `unattended-upgrades` configuration.
