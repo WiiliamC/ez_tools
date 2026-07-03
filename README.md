@@ -91,6 +91,24 @@ Example:
 
 The script validates that the port is between `1` and `65535`, then reports whether it is available or in use. It uses `lsof`, `ss`, or `netstat`, depending on which command is available on the system.
 
+## csv_view.sh
+
+Views CSV data as aligned terminal columns with horizontal scrolling.
+
+```bash
+./csv_view.sh <csv_file>
+cat data.csv | ./csv_view.sh
+```
+
+Examples:
+
+```bash
+./csv_view.sh data.csv
+cat data.csv | ./csv_view.sh
+```
+
+The script parses CSV with Python's standard `csv` module, aligns fields into terminal columns, and opens the output in `less -S`, so long rows stay on one line and can be scrolled horizontally.
+
 ## kill_process.sh
 
 Finds processes whose full command line contains a keyword, shows the matching process information, and asks for confirmation before sending `TERM`.
