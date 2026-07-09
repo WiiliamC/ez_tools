@@ -174,6 +174,21 @@ Useful when Codex fails to start or run commands because unprivileged user names
 
 Requires `sudo` when not run as root. Restart Codex after running the script.
 
+## install_gh_for_ubuntu.sh
+
+Installs GitHub CLI `gh` on Ubuntu/Debian APT systems from the official GitHub CLI APT repository.
+
+```bash
+./install_gh_for_ubuntu.sh
+./install_gh_for_ubuntu.sh install
+./install_gh_for_ubuntu.sh status
+./install_gh_for_ubuntu.sh help
+```
+
+`install` writes the official GitHub CLI keyring to `/etc/apt/keyrings/githubcli-archive-keyring.gpg`, writes `/etc/apt/sources.list.d/github-cli.list`, updates APT package lists, and installs `gh`.
+
+Requires `sudo` when not run as root. The script installs `gh` only; run `gh auth login` separately if you want to authenticate.
+
 ## config_earlyoom.sh
 
 Installs and enables `earlyoom` on Ubuntu/Debian APT systems using the package defaults.
