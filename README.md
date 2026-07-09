@@ -141,7 +141,7 @@ Examples:
 ./hf_mirror_download.sh --include '*.safetensors' --include '*.json' meta-llama/Llama-3.1-8B
 ```
 
-Requires `huggingface-cli`:
+Requires the Hugging Face `hf` CLI:
 
 ```bash
 python3 -m pip install -U huggingface_hub

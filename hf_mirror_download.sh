@@ -17,8 +17,8 @@ Options:
   --repo-type TYPE          Repo type: model, dataset, or space. Default: model
   --include PATTERN         Include file pattern. Can be used multiple times.
   --exclude PATTERN         Exclude file pattern. Can be used multiple times.
-  --resume                  Resume incomplete downloads.
-  --no-symlinks             Store real files instead of symlinks in local dir.
+  --resume                  Accepted for compatibility; hf resumes downloads automatically.
+  --no-symlinks             Accepted for compatibility; hf local-dir downloads use real files.
   -h, --help                Show this help.
 
 Examples:
@@ -120,8 +120,8 @@ case "$repo_type" in
         ;;
 esac
 
-if ! command -v huggingface-cli >/dev/null 2>&1; then
-    echo "huggingface-cli not found." >&2
+if ! command -v hf >/dev/null 2>&1; then
+    echo "hf CLI not found." >&2
     echo "Install it with: python3 -m pip install -U huggingface_hub" >&2
     exit 127
 fi
@@ -132,7 +132,7 @@ fi
 
 mkdir -p -- "$output_dir"
 
-cmd=(huggingface-cli download "$repo_id" --repo-type "$repo_type" --local-dir "$output_dir")
+cmd=(hf download "$repo_id" --repo-type "$repo_type" --local-dir "$output_dir")
 
 if [ -n "$revision" ]; then
     cmd+=(--revision "$revision")
@@ -143,11 +143,11 @@ if [ -n "$token" ]; then
 fi
 
 if [ "$resume" = true ]; then
-    cmd+=(--resume-download)
+    echo "Note: --resume is no longer passed to hf; downloads resume automatically when possible." >&2
 fi
 
 if [ "$local_dir_use_symlinks" = false ]; then
-    cmd+=(--local-dir-use-symlinks False)
+    echo "Note: --no-symlinks is no longer passed to hf; local-dir downloads use real files." >&2
 fi
 
 for pattern in "${include_patterns[@]}"; do
