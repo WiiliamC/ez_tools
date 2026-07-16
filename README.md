@@ -189,6 +189,22 @@ Installs GitHub CLI `gh` on Ubuntu/Debian APT systems from the official GitHub C
 
 Requires `sudo` when not run as root. The script installs `gh` only; run `gh auth login` separately if you want to authenticate.
 
+## install_atlassian_mcp_for_codex.sh
+
+Configures the official Atlassian Rovo MCP server in the current user's global Codex configuration, then starts the interactive OAuth login flow.
+
+```bash
+./install_atlassian_mcp_for_codex.sh
+```
+
+The script requires the `codex` CLI and configures the MCP server as `atlassian` using `https://mcp.atlassian.com/v1/mcp/authv2`. If an MCP server with that name already exists, the script exits without replacing it. Remove the existing entry explicitly before retrying if replacement is intended.
+
+OAuth login normally opens a browser. Access may be restricted by your Atlassian organization's Rovo MCP, domain, or IP allowlist policies. If configuration succeeds but login fails, retry with:
+
+```bash
+codex mcp login atlassian
+```
+
 ## config_earlyoom.sh
 
 Installs and enables `earlyoom` on Ubuntu/Debian APT systems using the package defaults.
