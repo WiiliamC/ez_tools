@@ -13,7 +13,8 @@ usage() {
     echo "Options:"
     echo "  --repo PATH       Git repository path. Defaults to the current working directory's Git root."
     echo "  --max-loops N     Maximum review/fix loops. Default: ${DEFAULT_MAX_LOOPS}."
-    echo "  --log-dir PATH    Directory for logs. Default: <repo_root>/.review_untill_satisfied/logs."
+    echo "  --log-dir PATH    Directory for logs; it must be outside the target repository."
+    echo "                    Default: <XDG_STATE_HOME or ~/.local/state>/review_untill_satisfied/<repo>/logs."
     echo "  -h, --help        Show this help message."
 }
 
@@ -68,6 +69,15 @@ resolve_json_python() {
 
     error "No Python interpreter found. Set REVIEW_UNTIL_PYTHON or install python3/python."
     exit 2
+}
+
+resolve_path() {
+    "$JSON_PYTHON" - "$1" <<'PY'
+import sys
+from pathlib import Path
+
+print(Path(sys.argv[1]).resolve(strict=False))
+PY
 }
 
 parse_review_status() {
@@ -188,11 +198,37 @@ project_root="$(resolve_git_root "$repo_target")"
 JSON_PYTHON="$(resolve_json_python)"
 if [ -n "$log_dir_arg" ]; then
     log_dir="$log_dir_arg"
+    tool_owned_log_dir=false
 else
-    log_dir="${project_root}/.review_untill_satisfied/logs"
+    if [ -n "${XDG_STATE_HOME:-}" ]; then
+        state_root="$XDG_STATE_HOME"
+        if [[ "$state_root" != /* ]]; then
+            error "XDG_STATE_HOME must be an absolute path."
+            exit 2
+        fi
+    else
+        if [ -z "${HOME:-}" ] || [[ "$HOME" != /* ]]; then
+            error "HOME must be an absolute path when XDG_STATE_HOME is not set."
+            exit 2
+        fi
+        state_root="${HOME}/.local/state"
+    fi
+    repo_name="$(basename -- "$project_root")"
+    log_dir="${state_root}/review_untill_satisfied/${repo_name}/logs"
+    tool_owned_log_dir=true
 fi
-log_file="${log_dir}/${exec_datetime}.log"
+
+log_dir="$(resolve_path "$log_dir")"
+if [ "$log_dir" = "$project_root" ] || [[ "$log_dir" == "$project_root/"* ]]; then
+    error "Log directory must be outside the target repository: ${project_root}"
+    exit 2
+fi
+
 mkdir -p "$log_dir"
+if [ "$tool_owned_log_dir" = true ]; then
+    chmod 700 "$log_dir"
+fi
+log_file="$(mktemp "${log_dir}/${exec_datetime}.XXXXXX.log")"
 
 tmp_dir="$(mktemp -d)"
 schema_file="${tmp_dir}/review_schema.json"

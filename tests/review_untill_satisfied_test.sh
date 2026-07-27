@@ -104,10 +104,32 @@ if [[ "${count}" -eq 1 || "${count}" -eq 3 ]]; then
     printf '{"satisfied":true,"summary":"clean","findings":[]}\n' >"${output_last_message}"
   fi
 else
+  if [[ "${FAKE_CODEX_DELETE_REVIEW_DIR_ON_FIX:-}" == "1" ]]; then
+    rm -rf -- .review_untill_satisfied
+  fi
   printf '%s\n' "${prompt:-}" >"${FAKE_CODEX_FIX_PROMPT}"
 fi
 EOF
 chmod +x "${tmp_dir}/bin/codex"
+
+cat >"${tmp_dir}/bin/date" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-}" in
+  +%Y%m%d_%H%M%S)
+    printf '20260727_120000\n'
+    ;;
+  '+Started: %Y-%m-%d %H:%M:%S')
+    printf 'Started: 2026-07-27 12:00:00\n'
+    ;;
+  *)
+    exec /usr/bin/date "$@"
+    ;;
+esac
+EOF
+chmod +x "${tmp_dir}/bin/date"
+
 export PATH="${tmp_dir}/bin:${PATH}"
 
 log_dir="${tmp_dir}/logs"
@@ -139,6 +161,132 @@ fi
 if ! grep -Fq -- "--output-last-message" "${FAKE_CODEX_ARGS_LOG}"; then
   printf 'Expected review command to use --output-last-message. Args:\n' >&2
   cat "${FAKE_CODEX_ARGS_LOG}" >&2
+  exit 1
+fi
+
+default_state_dir="${tmp_dir}/state"
+mkdir -p "${test_repo}/.review_untill_satisfied/logs"
+printf 'active log\n' >"${test_repo}/.review_untill_satisfied/logs/active.log"
+rm -f "${FAKE_CODEX_STATE}"
+export FAKE_CODEX_DELETE_REVIEW_DIR_ON_FIX=1
+default_output="$(XDG_STATE_HOME="${default_state_dir}" "${script}" --repo "${test_repo}" --max-loops 2)"
+unset FAKE_CODEX_DELETE_REVIEW_DIR_ON_FIX
+
+if [[ "${default_output}" != *"Review passed on loop 2"* ]]; then
+  printf 'Expected default-path review loop to pass after target log deletion. Output:\n%s\n' \
+    "${default_output}" >&2
+  exit 1
+fi
+
+if [[ -e "${test_repo}/.review_untill_satisfied" ]]; then
+  echo "Expected fake fix to delete the target repository's review directory" >&2
+  exit 1
+fi
+
+default_log_dir="${default_state_dir}/review_untill_satisfied/$(basename "${test_repo}")/logs"
+default_log_file="$(find "${default_log_dir}" -type f -name '*.log' -print -quit)"
+if [[ -z "${default_log_file}" ]]; then
+  echo "Expected the default log outside the target repository" >&2
+  exit 1
+fi
+
+if [[ "$(stat -c '%a' "${default_log_dir}")" != "700" ]]; then
+  echo "Expected default log directory mode 700" >&2
+  exit 1
+fi
+
+if [[ "$(stat -c '%a' "${default_log_file}")" != "600" ]]; then
+  echo "Expected default log file mode 600" >&2
+  exit 1
+fi
+
+assert_log_dir_rejected() {
+  local name="$1"
+  local rejected_log_dir="$2"
+  local case_output
+  local case_status
+
+  rm -f "${FAKE_CODEX_STATE}"
+  set +e
+  case_output="$("${script}" --repo "${test_repo}" --max-loops 1 \
+    --log-dir "${rejected_log_dir}" 2>&1)"
+  case_status=$?
+  set -e
+
+  if [[ "${case_status}" -ne 2 ]]; then
+    printf 'Expected %s log directory to exit 2, got %s. Output:\n%s\n' \
+      "${name}" "${case_status}" "${case_output}" >&2
+    exit 1
+  fi
+
+  if [[ "${case_output}" != *"Log directory must be outside the target repository"* ]]; then
+    printf 'Expected repository-boundary diagnostic for %s. Output:\n%s\n' \
+      "${name}" "${case_output}" >&2
+    exit 1
+  fi
+
+  if [[ -e "${FAKE_CODEX_STATE}" ]]; then
+    printf 'Expected %s validation to fail before invoking Codex\n' "${name}" >&2
+    exit 1
+  fi
+}
+
+assert_log_dir_rejected "repository root" "${test_repo}"
+assert_log_dir_rejected "repository child" "${test_repo}/new-logs"
+
+ln -s "${test_repo}/linked-logs" "${tmp_dir}/log-dir-symlink"
+assert_log_dir_rejected "symlink into repository" "${tmp_dir}/log-dir-symlink"
+
+assert_state_root_rejected() {
+  local name="$1"
+  local expected_diagnostic="$2"
+  shift 2
+  local case_output
+  local case_status
+
+  rm -f "${FAKE_CODEX_STATE}"
+  set +e
+  case_output="$(env "$@" "${script}" --repo "${test_repo}" --max-loops 1 2>&1)"
+  case_status=$?
+  set -e
+
+  if [[ "${case_status}" -ne 2 || "${case_output}" != *"${expected_diagnostic}"* ]]; then
+    printf 'Expected invalid %s state root to exit 2. Output:\n%s\n' \
+      "${name}" "${case_output}" >&2
+    exit 1
+  fi
+
+  if [[ -e "${FAKE_CODEX_STATE}" ]]; then
+    printf 'Expected %s validation to fail before invoking Codex\n' "${name}" >&2
+    exit 1
+  fi
+}
+
+assert_state_root_rejected \
+  "relative XDG_STATE_HOME" \
+  "XDG_STATE_HOME must be an absolute path" \
+  XDG_STATE_HOME=relative-state
+assert_state_root_rejected \
+  "missing HOME" \
+  "HOME must be an absolute path" \
+  -u XDG_STATE_HOME -u HOME
+assert_state_root_rejected \
+  "relative HOME" \
+  "HOME must be an absolute path" \
+  -u XDG_STATE_HOME HOME=relative-home
+
+unique_state_dir="${tmp_dir}/unique-state"
+export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"clean","findings":[]}'
+for _ in 1 2; do
+  rm -f "${FAKE_CODEX_STATE}"
+  XDG_STATE_HOME="${unique_state_dir}" \
+    "${script}" --repo "${test_repo}" --max-loops 1 >/dev/null
+done
+unset FAKE_CODEX_REVIEW_RESPONSE
+
+unique_log_dir="${unique_state_dir}/review_untill_satisfied/$(basename "${test_repo}")/logs"
+if [[ "$(find "${unique_log_dir}" -type f -name '*.log' | wc -l)" -ne 2 ]]; then
+  echo "Expected same-second runs to create distinct log files" >&2
   exit 1
 fi
 

@@ -26,6 +26,23 @@ The last argument is treated as the log file path. For shell syntax such as pipe
 ./run_in_backend.sh bash -lc 'npm run dev | cat' /tmp/dev.log
 ```
 
+## review_untill_satisfied.sh
+
+Runs Codex review/fix cycles against a Git repository until the review is
+satisfied or the configured loop limit is reached.
+
+```bash
+./review_untill_satisfied.sh --repo ../my-project/
+```
+
+Logs default to
+`${XDG_STATE_HOME:-$HOME/.local/state}/review_untill_satisfied/<repo>/logs/`.
+The log directory is kept outside the target repository so review/fix agents
+cannot treat the active log as a repository artifact or delete it. You can
+override the location with `--log-dir PATH`, but the resolved path must remain
+outside the target repository. Existing logs from older versions are not moved
+or deleted automatically.
+
 ## daily_task.sh
 
 Manages daily cron tasks for the current user.
