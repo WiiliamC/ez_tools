@@ -133,10 +133,22 @@ chmod +x "${tmp_dir}/bin/date"
 export PATH="${tmp_dir}/bin:${PATH}"
 
 log_dir="${tmp_dir}/logs"
-output="$("${script}" --repo "${test_repo}" --max-loops 2 --log-dir "${log_dir}")"
+output="$(TERMINAL_TAB_SPINNER_FORCE=1 \
+  "${script}" --repo "${test_repo}" --max-loops 2 --log-dir "${log_dir}")"
 
 if [[ "${output}" != *"Review passed on loop 2"* ]]; then
   printf 'Expected review loop to pass on second review. Output:\n%s\n' "${output}" >&2
+  exit 1
+fi
+
+if [[ "${output}" != *"Reviewing 1/2"* || "${output}" != *"Fixing 1/2"* ]]; then
+  printf 'Expected review and fix spinner titles. Output:\n%q\n' "${output}" >&2
+  exit 1
+fi
+
+expected_final_title="$(printf '\033]0;! %s\007' "$(basename "${test_repo}")")"
+if [[ "${output}" != *"${expected_final_title}" ]]; then
+  printf 'Expected final attention title. Output:\n%q\n' "${output}" >&2
   exit 1
 fi
 
@@ -302,13 +314,20 @@ assert_invalid_review_fails() {
   export FAKE_CODEX_REVIEW_RESPONSE="${response}"
 
   set +e
-  case_output="$("${script}" --repo "${test_repo}" --max-loops 1 --log-dir "${case_log_dir}" 2>&1)"
+  case_output="$(TERMINAL_TAB_SPINNER_FORCE=1 \
+    "${script}" --repo "${test_repo}" --max-loops 1 --log-dir "${case_log_dir}" 2>&1)"
   case_status=$?
   set -e
 
   if [[ "${case_status}" -ne 2 ]]; then
     printf 'Expected inconsistent %s review to exit 2, got %s. Output:\n%s\n' \
       "${name}" "${case_status}" "${case_output}" >&2
+    exit 1
+  fi
+
+  if [[ "${case_output}" != *"${expected_final_title}" ]]; then
+    printf 'Expected final attention title after invalid %s review. Output:\n%q\n' \
+      "${name}" "${case_output}" >&2
     exit 1
   fi
 

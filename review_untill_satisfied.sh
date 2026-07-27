@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=terminal_tab_spinner.sh
+source "${script_dir}/terminal_tab_spinner.sh"
+
 DEFAULT_MAX_LOOPS=5
 exec_datetime="$(date '+%Y%m%d_%H%M%S')"
 
@@ -195,6 +199,7 @@ if ! is_positive_integer "$max_loops"; then
 fi
 
 project_root="$(resolve_git_root "$repo_target")"
+project_name="$(basename -- "$project_root")"
 JSON_PYTHON="$(resolve_json_python)"
 if [ -n "$log_dir_arg" ]; then
     log_dir="$log_dir_arg"
@@ -285,7 +290,10 @@ Return a structured final JSON message that matches the provided output schema:
 Set satisfied to true exactly when the review finds no remaining issues, and in that case return an empty findings array. When unsatisfied, include one or more concise, actionable findings, each as an object with only an issue string.'
 
 cleanup() {
-    rm -rf "$tmp_dir"
+    local status=$?
+    terminal_tab_spinner_finish "$project_name" || true
+    rm -rf "$tmp_dir" || true
+    return "$status"
 }
 trap cleanup EXIT
 
@@ -306,13 +314,17 @@ for ((loop = 1; loop <= max_loops; loop++)); do
         date '+Started: %Y-%m-%d %H:%M:%S'
     } >> "$log_file"
 
+    terminal_tab_spinner_start "$project_name" "Reviewing ${loop}/${max_loops}"
     if (
         cd "$project_root"
         codex exec --sandbox read-only --output-schema "$schema_file" --output-last-message "$review_json" "$review_prompt"
     ) >> "$log_file" 2>&1; then
-        :
+        status=0
     else
         status=$?
+    fi
+    terminal_tab_spinner_stop
+    if [ "$status" -ne 0 ]; then
         {
             echo "Review command failed with exit code ${status}"
             echo ""
@@ -358,15 +370,19 @@ for ((loop = 1; loop <= max_loops; loop++)); do
         date '+Started: %Y-%m-%d %H:%M:%S'
     } >> "$log_file"
 
+    terminal_tab_spinner_start "$project_name" "Fixing ${loop}/${max_loops}"
     if (
         cd "$project_root"
         codex exec --sandbox workspace-write "$(printf '%s\n\n%s' \
             'Use the following structured review JSON as context. Make only minimal fixes for the listed findings, avoid unrelated refactors, and run focused verification where practical.' \
             "$(cat "$review_json")")"
     ) >> "$log_file" 2>&1; then
-        :
+        status=0
     else
         status=$?
+    fi
+    terminal_tab_spinner_stop
+    if [ "$status" -ne 0 ]; then
         {
             echo "Fix command failed with exit code ${status}"
             echo ""
