@@ -45,13 +45,18 @@ for arg in "$@"; do
 done
 
 output_last_message=""
+output_schema=""
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --output-last-message)
       output_last_message="${2:-}"
       shift 2
       ;;
-    --output-schema|--sandbox)
+    --output-schema)
+      output_schema="${2:-}"
+      shift 2
+      ;;
+    --sandbox)
       shift 2
       ;;
     *)
@@ -60,6 +65,23 @@ while [[ "$#" -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "${output_schema}" ]]; then
+  python3 - "${output_schema}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+schema = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+items = schema["properties"]["findings"]["items"]
+assert items == {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"issue": {"type": "string"}},
+    "required": ["issue"],
+}
+PY
+fi
 
 count=0
 if [[ -f "${FAKE_CODEX_STATE}" ]]; then
@@ -74,7 +96,9 @@ if [[ "${count}" -eq 1 || "${count}" -eq 3 ]]; then
     exit 2
   fi
 
-  if [[ "${count}" -eq 1 ]]; then
+  if [[ -n "${FAKE_CODEX_REVIEW_RESPONSE:-}" ]]; then
+    printf '%s\n' "${FAKE_CODEX_REVIEW_RESPONSE}" >"${output_last_message}"
+  elif [[ "${count}" -eq 1 ]]; then
     printf '{"satisfied":false,"summary":"needs one fix","findings":[{"issue":"demo"}]}\n' >"${output_last_message}"
   else
     printf '{"satisfied":true,"summary":"clean","findings":[]}\n' >"${output_last_message}"
@@ -117,3 +141,47 @@ if ! grep -Fq -- "--output-last-message" "${FAKE_CODEX_ARGS_LOG}"; then
   cat "${FAKE_CODEX_ARGS_LOG}" >&2
   exit 1
 fi
+
+assert_invalid_review_fails() {
+  local name="$1"
+  local response="$2"
+  local expected_diagnostic="$3"
+  local case_log_dir="${tmp_dir}/logs-${name}"
+  local case_output
+  local case_status
+
+  rm -f "${FAKE_CODEX_STATE}"
+  export FAKE_CODEX_REVIEW_RESPONSE="${response}"
+
+  set +e
+  case_output="$("${script}" --repo "${test_repo}" --max-loops 1 --log-dir "${case_log_dir}" 2>&1)"
+  case_status=$?
+  set -e
+
+  if [[ "${case_status}" -ne 2 ]]; then
+    printf 'Expected inconsistent %s review to exit 2, got %s. Output:\n%s\n' \
+      "${name}" "${case_status}" "${case_output}" >&2
+    exit 1
+  fi
+
+  local case_log
+  case_log="$(find "${case_log_dir}" -type f -name '*.log' -print -quit)"
+  if ! grep -Fq -- "${expected_diagnostic}" "${case_log}"; then
+    printf 'Expected invalid %s review diagnostic. Log:\n' "${name}" >&2
+    cat "${case_log}" >&2
+    exit 1
+  fi
+}
+
+assert_invalid_review_fails \
+  "false-empty" \
+  '{"satisfied":false,"summary":"contradictory","findings":[]}' \
+  "satisfied must be true exactly when findings is empty"
+assert_invalid_review_fails \
+  "true-nonempty" \
+  '{"satisfied":true,"summary":"contradictory","findings":[{"issue":"demo"}]}' \
+  "satisfied must be true exactly when findings is empty"
+assert_invalid_review_fails \
+  "extra-top-level-property" \
+  '{"satisfied":true,"summary":"clean","findings":[],"extra":"unexpected"}' \
+  "top-level object must contain exactly satisfied, summary, and findings"

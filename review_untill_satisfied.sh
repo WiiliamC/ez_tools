@@ -101,12 +101,24 @@ schema_errors = []
 if not isinstance(review, dict):
     schema_errors.append("top-level value is not an object")
 else:
+    if set(review) != {"satisfied", "summary", "findings"}:
+        schema_errors.append(
+            "top-level object must contain exactly satisfied, summary, and findings"
+        )
     if not isinstance(review.get("satisfied"), bool):
         schema_errors.append("satisfied must be a boolean")
     if not isinstance(review.get("summary"), str):
         schema_errors.append("summary must be a string")
     if not isinstance(review.get("findings"), list):
         schema_errors.append("findings must be an array")
+    else:
+        for index, finding in enumerate(review["findings"]):
+            if not isinstance(finding, dict):
+                schema_errors.append(f"findings[{index}] must be an object")
+            elif set(finding) != {"issue"} or not isinstance(finding.get("issue"), str):
+                schema_errors.append(
+                    f"findings[{index}] must contain only a string issue field"
+                )
 
 if schema_errors:
     print(f"Review JSON from {path} does not match expected schema: {', '.join(schema_errors)}", file=sys.stderr)
@@ -120,10 +132,16 @@ satisfied = review.get("satisfied") is True
 findings = review.get("findings")
 findings_empty = isinstance(findings, list) and len(findings) == 0
 
-if satisfied or findings_empty:
+if satisfied and findings_empty:
     print("pass")
-else:
+elif not satisfied and not findings_empty:
     print("fail")
+else:
+    print(
+        "Review JSON is inconsistent: satisfied must be true exactly when findings is empty",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 PY
 }
 
@@ -193,7 +211,18 @@ cat > "$schema_file" <<'JSON'
     },
     "findings": {
       "type": "array",
-      "items": {}
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "issue": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "issue"
+        ]
+      }
     }
   },
   "required": [
@@ -210,10 +239,14 @@ Return a structured final JSON message that matches the provided output schema:
 {
   "satisfied": boolean,
   "summary": string,
-  "findings": array
+  "findings": [
+    {
+      "issue": string
+    }
+  ]
 }
 
-Set satisfied to true only when the review finds no remaining issues. When unsatisfied, include concise, actionable findings.'
+Set satisfied to true exactly when the review finds no remaining issues, and in that case return an empty findings array. When unsatisfied, include one or more concise, actionable findings, each as an object with only an issue string.'
 
 cleanup() {
     rm -rf "$tmp_dir"
@@ -267,7 +300,7 @@ for ((loop = 1; loop <= max_loops; loop++)); do
         :
     else
         status=$?
-        error "Could not parse review JSON. See log: ${log_file}"
+        error "Could not validate review JSON. See log: ${log_file}"
         exit "$status"
     fi
     if [ "$review_status" = "pass" ]; then
