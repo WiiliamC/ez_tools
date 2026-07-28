@@ -59,6 +59,9 @@ while [[ "$#" -gt 0 ]]; do
     --sandbox)
       shift 2
       ;;
+    -c|--config)
+      shift 2
+      ;;
     *)
       prompt="$1"
       shift
@@ -132,12 +135,58 @@ chmod +x "${tmp_dir}/bin/date"
 
 export PATH="${tmp_dir}/bin:${PATH}"
 
+help_output="$("${script}" --help)"
+if [[ "${help_output}" != *"--fast"* || "${help_output}" != *"Default: disabled"* ]]; then
+  printf 'Expected help to document --fast as disabled by default. Output:\n%s\n' \
+    "${help_output}" >&2
+  exit 1
+fi
+
+set +e
+unknown_output="$("${script}" --unknown 2>&1)"
+unknown_status=$?
+set -e
+if [[ "${unknown_status}" -ne 2 || "${unknown_output}" != *"Unknown argument: --unknown"* ]]; then
+  printf 'Expected unknown argument to exit 2. Output:\n%s\n' "${unknown_output}" >&2
+  exit 1
+fi
+
 log_dir="${tmp_dir}/logs"
 output="$(TERMINAL_TAB_SPINNER_FORCE=1 \
   "${script}" --repo "${test_repo}" --max-loops 2 --log-dir "${log_dir}")"
 
 if [[ "${output}" != *"Review passed on loop 2"* ]]; then
   printf 'Expected review loop to pass on second review. Output:\n%s\n' "${output}" >&2
+  exit 1
+fi
+
+if [[ "${output}" != *"Review feedback 1/2:"* ]] ||
+  [[ "${output}" != *"Status: changes requested"* ]] ||
+  [[ "${output}" != *"needs one fix"* ]] ||
+  [[ "${output}" != *"1. demo"* ]]; then
+  printf 'Expected friendly first-loop review feedback. Output:\n%s\n' "${output}" >&2
+  exit 1
+fi
+
+if [[ "${output}" != *"Modification prompt 1/2:"* ]] ||
+  [[ "${output}" != *"Use the following structured review JSON as context."* ]] ||
+  [[ "${output}" != *'"satisfied":false'* ]]; then
+  printf 'Expected the complete first-loop modification prompt. Output:\n%s\n' "${output}" >&2
+  exit 1
+fi
+
+if [[ "${output}" != *"Review feedback 2/2:"* ]] ||
+  [[ "${output}" != *"Status: satisfied"* ]] ||
+  [[ "${output}" != *"clean"* ]] ||
+  [[ "${output}" != *"Findings:"* ]] ||
+  [[ "${output}" != *"None"* ]]; then
+  printf 'Expected friendly passing review feedback. Output:\n%s\n' "${output}" >&2
+  exit 1
+fi
+
+if [[ "${output}" == *"Modification prompt 2/2:"* ]]; then
+  printf 'Did not expect a modification prompt after the passing review. Output:\n%s\n' \
+    "${output}" >&2
   exit 1
 fi
 
@@ -170,9 +219,129 @@ if ! grep -Fq -- '"satisfied":false' "${FAKE_CODEX_FIX_PROMPT}"; then
   exit 1
 fi
 
+printed_fix_prompt="${output#*Modification prompt 1/2:}"
+printed_fix_prompt="${printed_fix_prompt%%Fixing 1/2*}"
+if [[ "${printed_fix_prompt}" != *"$(cat "${FAKE_CODEX_FIX_PROMPT}")"* ]]; then
+  printf 'Expected the printed prompt to match the prompt sent to Codex. Output:\n%s\n' \
+    "${output}" >&2
+  exit 1
+fi
+
 if ! grep -Fq -- "--output-last-message" "${FAKE_CODEX_ARGS_LOG}"; then
   printf 'Expected review command to use --output-last-message. Args:\n' >&2
   cat "${FAKE_CODEX_ARGS_LOG}" >&2
+  exit 1
+fi
+
+default_invocation_count="$(grep -c '^exec ' "${FAKE_CODEX_ARGS_LOG}")"
+default_tier_count="$(grep -c '^exec -c service_tier="default" ' "${FAKE_CODEX_ARGS_LOG}")"
+if [[ "${default_tier_count}" -ne "${default_invocation_count}" ]]; then
+  printf 'Expected every default Codex invocation to disable Fast. Args:\n' >&2
+  cat "${FAKE_CODEX_ARGS_LOG}" >&2
+  exit 1
+fi
+
+rm -f "${FAKE_CODEX_STATE}"
+: >"${FAKE_CODEX_ARGS_LOG}"
+export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"clean","findings":[]}'
+"${script}" --repo "${test_repo}" --max-loops 1 --log-dir "${tmp_dir}/fast-logs" \
+  --fast >/dev/null
+unset FAKE_CODEX_REVIEW_RESPONSE
+
+if [[ "$(grep -c '^exec ' "${FAKE_CODEX_ARGS_LOG}")" -ne 1 ]] ||
+  ! grep -q -- '^exec -c service_tier="fast" ' "${FAKE_CODEX_ARGS_LOG}"; then
+  printf 'Expected --fast to select Fast for the Codex invocation. Args:\n' >&2
+  cat "${FAKE_CODEX_ARGS_LOG}" >&2
+  exit 1
+fi
+
+rm -f "${FAKE_CODEX_STATE}"
+export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":false,"summary":"still blocked","findings":[{"issue":"remaining issue"}]}'
+set +e
+max_loop_output="$("${script}" --repo "${test_repo}" --max-loops 1 \
+  --log-dir "${tmp_dir}/max-loop-logs" 2>&1)"
+max_loop_status=$?
+set -e
+unset FAKE_CODEX_REVIEW_RESPONSE
+
+if [[ "${max_loop_status}" -ne 1 ]] ||
+  [[ "${max_loop_output}" != *"Review feedback 1/1:"* ]] ||
+  [[ "${max_loop_output}" != *"still blocked"* ]] ||
+  [[ "${max_loop_output}" != *"1. remaining issue"* ]]; then
+  printf 'Expected final unsatisfied review feedback at the loop limit. Output:\n%s\n' \
+    "${max_loop_output}" >&2
+  exit 1
+fi
+
+if [[ "${max_loop_output}" == *"Modification prompt 1/1:"* ]]; then
+  printf 'Did not expect a modification prompt after the final allowed review. Output:\n%s\n' \
+    "${max_loop_output}" >&2
+  exit 1
+fi
+
+rm -f "${FAKE_CODEX_STATE}"
+export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":false,"summary":"safe\u001b[2J\nnext\u000dline","findings":[{"issue":"bell\u0007 and c1\u009b"}]}'
+set +e
+control_output="$("${script}" --repo "${test_repo}" --max-loops 1 \
+  --log-dir "${tmp_dir}/control-logs" 2>&1)"
+control_status=$?
+set -e
+unset FAKE_CODEX_REVIEW_RESPONSE
+
+if [[ "${control_status}" -ne 1 ]] ||
+  [[ "${control_output}" == *$'\033'* ]] ||
+  [[ "${control_output}" == *$'\a'* ]] ||
+  [[ "${control_output}" == *$'\r'* ]] ||
+  [[ "${control_output}" == *$'\u009b'* ]] ||
+  [[ "${control_output}" != *'safe\u001b[2J'* ]] ||
+  [[ "${control_output}" != *'next\u000dline'* ]] ||
+  [[ "${control_output}" != *'bell\u0007 and c1\u009b'* ]]; then
+  printf 'Expected review feedback to visualize terminal control characters. Output:\n%q\n' \
+    "${control_output}" >&2
+  exit 1
+fi
+
+rm -f "${FAKE_CODEX_STATE}" "${FAKE_CODEX_FIX_PROMPT}"
+export FAKE_CODEX_REVIEW_RESPONSE=$'{"satisfied":false,"summary":"raw c1 \u009b","findings":[{"issue":"remaining issue"}]}'
+set +e
+prompt_control_output="$("${script}" --repo "${test_repo}" --max-loops 2 \
+  --log-dir "${tmp_dir}/prompt-control-logs" 2>&1)"
+prompt_control_status=$?
+set -e
+unset FAKE_CODEX_REVIEW_RESPONSE
+
+if [[ "${prompt_control_status}" -ne 1 ]] ||
+  [[ "${prompt_control_output}" == *$'\u009b'* ]] ||
+  [[ "${prompt_control_output}" != *'raw c1 \u009b'* ]]; then
+  printf 'Expected the displayed modification prompt to visualize C1 controls. Output:\n%q\n' \
+    "${prompt_control_output}" >&2
+  exit 1
+fi
+
+if [[ "$(cat "${FAKE_CODEX_FIX_PROMPT}")" != *$'raw c1 \u009b'* ]]; then
+  printf 'Expected Codex to receive the original C1 control in the modification prompt. Prompt:\n%q\n' \
+    "$(cat "${FAKE_CODEX_FIX_PROMPT}")" >&2
+  exit 1
+fi
+
+rm -f "${FAKE_CODEX_STATE}" "${FAKE_CODEX_FIX_PROMPT}"
+export FAKE_CODEX_REVIEW_RESPONSE=$'{"satisfied":false,"summary":"中文摘要","findings":[{"issue":"中文问题和原始 C1 \u009b"}]}'
+set +e
+ascii_io_output="$(PYTHONIOENCODING=ascii \
+  "${script}" --repo "${test_repo}" --max-loops 2 \
+  --log-dir "${tmp_dir}/ascii-io-logs" 2>&1)"
+ascii_io_status=$?
+set -e
+unset FAKE_CODEX_REVIEW_RESPONSE
+
+if [[ "${ascii_io_status}" -ne 1 ]] ||
+  [[ "${ascii_io_output}" != *"中文摘要"* ]] ||
+  [[ "${ascii_io_output}" != *'中文问题和原始 C1 \u009b'* ]] ||
+  [[ "${ascii_io_output}" != *"Modification prompt 1/2:"* ]] ||
+  [[ "${ascii_io_output}" == *"UnicodeEncodeError"* ]] ||
+  [[ "${ascii_io_output}" == *"UnicodeDecodeError"* ]]; then
+  printf 'Expected UTF-8 review rendering with an ASCII inherited Python I/O encoding. Output:\n%q\n' \
+    "${ascii_io_output}" >&2
   exit 1
 fi
 

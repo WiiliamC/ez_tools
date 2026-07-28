@@ -33,7 +33,12 @@ satisfied or the configured loop limit is reached.
 
 ```bash
 ./review_untill_satisfied.sh --repo ../my-project/
+./review_untill_satisfied.sh --repo ../my-project/ --fast
 ```
+
+The script explicitly uses the default Codex service tier, even if Fast is
+enabled in user or project configuration. Pass `--fast` to use the Fast service
+tier for both review and fix steps.
 
 Logs default to
 `${XDG_STATE_HOME:-$HOME/.local/state}/review_untill_satisfied/<repo>/logs/`.

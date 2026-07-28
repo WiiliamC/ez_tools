@@ -19,6 +19,7 @@ usage() {
     echo "  --max-loops N     Maximum review/fix loops. Default: ${DEFAULT_MAX_LOOPS}."
     echo "  --log-dir PATH    Directory for logs; it must be outside the target repository."
     echo "                    Default: <XDG_STATE_HOME or ~/.local/state>/review_untill_satisfied/<repo>/logs."
+    echo "  --fast            Use the Codex Fast service tier. Default: disabled."
     echo "  -h, --help        Show this help message."
 }
 
@@ -159,9 +160,70 @@ else:
 PY
 }
 
+print_review_feedback() {
+    "$JSON_PYTHON" - "$1" "$2" "$3" <<'PY'
+import json
+import sys
+import unicodedata
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding="utf-8")
+
+review = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+loop = sys.argv[2]
+max_loops = sys.argv[3]
+
+def terminal_safe(text):
+    return "".join(
+        char
+        if char == "\n" or unicodedata.category(char) != "Cc"
+        else f"\\u{ord(char):04x}"
+        for char in text
+    )
+
+print(f"Review feedback {loop}/{max_loops}:")
+print(f"  Status: {'satisfied' if review['satisfied'] else 'changes requested'}")
+print("  Summary:")
+summary_lines = terminal_safe(review["summary"]).split("\n")
+for line in summary_lines:
+    print(f"    {line}")
+
+print("  Findings:")
+if not review["findings"]:
+    print("    None")
+else:
+    for index, finding in enumerate(review["findings"], start=1):
+        issue_lines = terminal_safe(finding["issue"]).split("\n")
+        print(f"    {index}. {issue_lines[0]}")
+        for line in issue_lines[1:]:
+            print(f"       {line}")
+PY
+}
+
+print_terminal_safe() {
+    "$JSON_PYTHON" -c '
+import sys
+import unicodedata
+
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
+
+text = sys.stdin.read()
+sys.stdout.write(
+    "".join(
+        char
+        if char == "\n" or unicodedata.category(char) != "Cc"
+        else f"\\u{ord(char):04x}"
+        for char in text
+    )
+)
+'
+}
+
 repo_target="$PWD"
 max_loops="$DEFAULT_MAX_LOOPS"
 log_dir_arg=""
+service_tier="default"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -183,6 +245,10 @@ while [ $# -gt 0 ]; do
             require_value "$1" "${2:-}"
             log_dir_arg="$2"
             shift 2
+            ;;
+        --fast)
+            service_tier="fast"
+            shift
             ;;
         *)
             error "Unknown argument: $1"
@@ -301,7 +367,8 @@ trap cleanup EXIT
     echo "Review/fix loop started at ${exec_datetime}"
     echo "Project root: ${project_root}"
     echo "Max loops: ${max_loops}"
-    echo "Review command: codex exec --sandbox read-only --output-schema ${schema_file} --output-last-message ${review_json} <review prompt>"
+    echo "Service tier: ${service_tier}"
+    echo "Review command: codex exec -c service_tier=\"${service_tier}\" --sandbox read-only --output-schema ${schema_file} --output-last-message ${review_json} <review prompt>"
     echo ""
 } >> "$log_file"
 
@@ -317,7 +384,8 @@ for ((loop = 1; loop <= max_loops; loop++)); do
     terminal_tab_spinner_start "$project_name" "Reviewing ${loop}/${max_loops}"
     if (
         cd "$project_root"
-        codex exec --sandbox read-only --output-schema "$schema_file" --output-last-message "$review_json" "$review_prompt"
+        codex exec -c "service_tier=\"${service_tier}\"" --sandbox read-only \
+            --output-schema "$schema_file" --output-last-message "$review_json" "$review_prompt"
     ) >> "$log_file" 2>&1; then
         status=0
     else
@@ -351,6 +419,10 @@ for ((loop = 1; loop <= max_loops; loop++)); do
         error "Could not validate review JSON. See log: ${log_file}"
         exit "$status"
     fi
+
+    print_review_feedback "$review_json" "$loop" "$max_loops"
+    echo ""
+
     if [ "$review_status" = "pass" ]; then
         echo "Review passed on loop ${loop}. Log: ${log_file}"
         {
@@ -370,12 +442,21 @@ for ((loop = 1; loop <= max_loops; loop++)); do
         date '+Started: %Y-%m-%d %H:%M:%S'
     } >> "$log_file"
 
+    fix_prompt="$(printf '%s\n\n%s' \
+        'Use the following structured review JSON as context. Make only minimal fixes for the listed findings, avoid unrelated refactors, and run focused verification where practical.' \
+        "$(cat "$review_json")")"
+
+    echo "Modification prompt ${loop}/${max_loops}:"
+    printf '%s\n\n' "$fix_prompt" | print_terminal_safe
+    {
+        echo "--- Modification prompt ---"
+        printf '%s\n\n' "$fix_prompt"
+    } >> "$log_file"
+
     terminal_tab_spinner_start "$project_name" "Fixing ${loop}/${max_loops}"
     if (
         cd "$project_root"
-        codex exec --sandbox workspace-write "$(printf '%s\n\n%s' \
-            'Use the following structured review JSON as context. Make only minimal fixes for the listed findings, avoid unrelated refactors, and run focused verification where practical.' \
-            "$(cat "$review_json")")"
+        codex exec -c "service_tier=\"${service_tier}\"" --sandbox workspace-write "$fix_prompt"
     ) >> "$log_file" 2>&1; then
         status=0
     else
