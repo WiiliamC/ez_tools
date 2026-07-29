@@ -6,6 +6,8 @@ readonly PROGRAM="safe_ssh"
 readonly CONFIG_MARKER="# safe_ssh managed include"
 readonly CONFIG_RESET="Host * # safe_ssh managed scope reset"
 readonly OWNED_HEADER="# Managed by safe_ssh.sh; do not edit."
+readonly PREPARED_MARKER="# safe_ssh state: prepared"
+readonly ENABLED_MARKER="# safe_ssh state: enabled"
 SSHD_CONFIG_DIR="${SAFE_SSH_SSHD_CONFIG_DIR:-/etc/ssh/sshd_config.d}"
 SSHD_CONFIG_FILE="${SAFE_SSH_SSHD_CONFIG:-/etc/ssh/sshd_config}"
 OWNED_SSHD_CONFIG="${SSHD_CONFIG_DIR}/00-safe-ssh.conf"
@@ -27,10 +29,12 @@ LOG_FD=""
 usage() {
   cat <<'EOF'
 Usage:
-  safe_ssh.sh server_on [--admin-user USER] [--force]
+  safe_ssh.sh server_prepare
+  safe_ssh.sh server_on --admin-user USER
   safe_ssh.sh server_off
   safe_ssh.sh server_status
   safe_ssh.sh client_add NAME USER@HOST [--port PORT] [--bootstrap-identity PATH]
+  safe_ssh.sh client_test NAME
   safe_ssh.sh client_delete NAME [--local-only]
   safe_ssh.sh client_status [NAME]
 EOF
@@ -459,55 +463,175 @@ server_policy_effective() {
      " ${auth} " == *" .safe_ssh/authorized_keys "* ]]
 }
 
+server_prerequisites_effective() {
+  local effective="$1" pub auth
+  pub="$(awk 'tolower($1)=="pubkeyauthentication"{print tolower($2);exit}' <<<"${effective}")"
+  auth="$(awk 'tolower($1)=="authorizedkeysfile"{$1="";sub(/^ /,"");print;exit}' <<<"${effective}")"
+  [[ "${pub}" == yes && " ${auth} " == *" .safe_ssh/authorized_keys "* ]]
+}
+
+server_prerequisites_all_contexts_effective() {
+  local user="${1:-${INITIATOR_USER}}" effective context matched_status
+  effective="$(sshd_effective)" || return 1
+  server_prerequisites_effective "${effective}" || return 1
+  for context in \
+    "user=${user},host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=22" \
+    "user=${user},host=example.invalid,addr=192.0.2.1,laddr=192.0.2.2,lport=22" \
+    "user=root,host=localhost,addr=::1,laddr=::1,lport=22"; do
+    effective="$("${SSHD_BIN}" -T -C "${context}")" || return 1
+    server_prerequisites_effective "${effective}" || return 1
+  done
+  if matched_policy_directive >/dev/null; then
+    return 1
+  else
+    matched_status=$?
+    [[ "${matched_status}" == 1 ]]
+  fi
+}
+
+owned_server_state() {
+  [[ -f "${OWNED_SSHD_CONFIG}" && ! -L "${OWNED_SSHD_CONFIG}" ]] || return 1
+  grep -Fqx "${OWNED_HEADER}" "${OWNED_SSHD_CONFIG}" || return 1
+  if grep -Fqx "${ENABLED_MARKER}" "${OWNED_SSHD_CONFIG}"; then
+    printf 'enabled\n'
+  elif grep -Fqx "${PREPARED_MARKER}" "${OWNED_SSHD_CONFIG}"; then
+    printf 'prepared\n'
+  elif grep -Eiq '^[[:space:]]*PasswordAuthentication[[:space:]]+no[[:space:]]*$' "${OWNED_SSHD_CONFIG}" &&
+       grep -Eiq '^[[:space:]]*KbdInteractiveAuthentication[[:space:]]+no[[:space:]]*$' "${OWNED_SSHD_CONFIG}" &&
+       grep -Eiq '^[[:space:]]*AuthenticationMethods[[:space:]]+publickey[[:space:]]*$' "${OWNED_SSHD_CONFIG}" &&
+       grep -Eiq '^[[:space:]]*PubkeyAuthentication[[:space:]]+yes[[:space:]]*$' "${OWNED_SSHD_CONFIG}"; then
+    printf 'enabled\n'
+  else
+    printf 'unknown\n'
+  fi
+}
+
 sshd_service_active() {
   "${SYSTEMCTL_BIN}" is-active --quiet ssh.service 2>/dev/null ||
     "${SYSTEMCTL_BIN}" is-active --quiet sshd.service 2>/dev/null
 }
 
-server_on() {
-  require_root server_on
+server_prepare() {
+  require_root server_prepare
   ensure_server_scope
-  local admin="" force=0 baseline auth_values prior="" had_prior=0
+  local baseline auth_values prior="" had_prior=0 owned_state=""
   shift
-  while (($#)); do
-    case "$1" in
-      --admin-user) (($# >= 2)) || { printf 'Error: --admin-user needs USER\n' >&2; return 2; }; admin="$2"; shift 2 ;;
-      --force) force=1; shift ;;
-      *) printf 'Error: unknown server_on option: %s\n' "$1" >&2; return 2 ;;
+  (($# == 0)) || { printf 'Error: server_prepare takes no arguments\n' >&2; return 2; }
+  if [[ -e "${OWNED_SSHD_CONFIG}" ]]; then
+    owned_state="$(owned_server_state)" || {
+      printf 'Error: refusing to replace unowned file %s\n' "${OWNED_SSHD_CONFIG}" >&2
+      return 1
+    }
+    case "${owned_state}" in
+      enabled)
+        if sshd_service_active &&
+           server_policy_all_contexts_effective "${INITIATOR_USER}"; then
+          printf 'safe_ssh server policy is already enabled.\n'
+          return 0
+        fi
+        printf 'Error: owned enabled policy is not effective; inspect server_status before changing it\n' >&2
+        return 1
+        ;;
+      prepared)
+        if server_prerequisites_all_contexts_effective "${INITIATOR_USER}"; then
+          printf 'safe_ssh server is already prepared.\n'
+          return 0
+        fi
+        ;;
+      *)
+        printf 'Error: refusing to replace unrecognized owned file %s\n' "${OWNED_SSHD_CONFIG}" >&2
+        return 1
+        ;;
     esac
-  done
+  fi
   phase server_baseline
   baseline="$(sshd_effective)" || { printf 'Error: cannot read effective sshd configuration\n' >&2; return 1; }
   auth_values="$(awk 'tolower($1)=="authorizedkeysfile" {$1=""; sub(/^ /,""); print; exit}' <<<"${baseline}")"
   [[ -n "${auth_values}" ]] || auth_values=".ssh/authorized_keys .ssh/authorized_keys2"
-  if ((!force)); then
-    [[ -n "${admin}" ]] || { printf 'Error: --admin-user is required unless --force is used\n' >&2; return 1; }
-    admin_has_key "${admin}" "${auth_values}" || {
-      printf 'Error: %s has no usable key in the current or safe_ssh authorization files; refusing possible lockout\n' "${admin}" >&2
-      return 1
-    }
-    phase server_login_probe
-    admin_login_probe "${admin}" || {
-      printf 'Error: public-key login probe for %s failed; refusing possible lockout\n' "${admin}" >&2
-      return 1
-    }
-  fi
   if [[ " ${auth_values} " != *" .safe_ssh/authorized_keys "* ]]; then
     auth_values+=" .safe_ssh/authorized_keys"
   fi
   mkdir -p "${SSHD_CONFIG_DIR}"
   if [[ -e "${OWNED_SSHD_CONFIG}" ]]; then
-    grep -Fqx "${OWNED_HEADER}" "${OWNED_SSHD_CONFIG}" || {
-      printf 'Error: refusing to replace unowned file %s\n' "${OWNED_SSHD_CONFIG}" >&2
-      return 1
-    }
     prior="$(mktemp "${SSHD_CONFIG_DIR}/.safe_ssh.rollback.XXXXXX")"
     cp -p "${OWNED_SSHD_CONFIG}" "${prior}"
     had_prior=1
   fi
   phase server_write
   {
-    printf '%s\n' "${OWNED_HEADER}"
+    printf '%s\n%s\n' "${OWNED_HEADER}" "${PREPARED_MARKER}"
+    printf 'PubkeyAuthentication yes\n'
+    printf 'AuthorizedKeysFile %s\n' "${auth_values}"
+  } | write_atomic "${OWNED_SSHD_CONFIG}" 644
+  phase server_validate
+  if ! "${SSHD_BIN}" -t ||
+     ! server_prerequisites_all_contexts_effective "${INITIATOR_USER}"; then
+    printf 'Error: safe_ssh preparation is not effective in all checked SSH connection contexts\n' >&2
+    phase rollback
+    if ((had_prior)); then mv -f "${prior}" "${OWNED_SSHD_CONFIG}"; else rm -f "${OWNED_SSHD_CONFIG}"; fi
+    return 1
+  fi
+  phase server_reload
+  if ! reload_sshd; then
+    phase rollback
+    if ((had_prior)); then mv -f "${prior}" "${OWNED_SSHD_CONFIG}"; else rm -f "${OWNED_SSHD_CONFIG}"; fi
+    "${SSHD_BIN}" -t && reload_sshd || true
+    return 1
+  fi
+  [[ -z "${prior}" ]] || rm -f "${prior}"
+  printf 'safe_ssh server prepared for client key installation.\n'
+}
+
+server_on() {
+  require_root server_on
+  ensure_server_scope
+  local admin="" baseline auth_values prior="" owned_state legacy_enabled=0
+  shift
+  while (($#)); do
+    case "$1" in
+      --admin-user) (($# >= 2)) || { printf 'Error: --admin-user needs USER\n' >&2; return 2; }; admin="$2"; shift 2 ;;
+      *) printf 'Error: unknown server_on option: %s\n' "$1" >&2; return 2 ;;
+    esac
+  done
+  [[ -n "${admin}" ]] || { printf 'Error: --admin-user USER is required\n' >&2; return 2; }
+  owned_state="$(owned_server_state 2>/dev/null || true)"
+  if [[ "${owned_state}" == enabled ]]; then
+    if ! sshd_service_active ||
+       ! server_policy_all_contexts_effective "${admin}"; then
+      printf 'Error: owned enabled policy is not effective; inspect server_status before changing it\n' >&2
+      return 1
+    fi
+    if grep -Fqx "${ENABLED_MARKER}" "${OWNED_SSHD_CONFIG}"; then
+      printf 'safe_ssh server policy is already enabled.\n'
+      return 0
+    fi
+    legacy_enabled=1
+  fi
+  [[ "${owned_state}" == prepared || "${legacy_enabled}" == 1 ]] || {
+    printf 'Error: server_prepare must complete before server_on\n' >&2
+    return 1
+  }
+  phase server_baseline
+  baseline="$(sshd_effective)" || { printf 'Error: cannot read effective sshd configuration\n' >&2; return 1; }
+  auth_values="$(awk 'tolower($1)=="authorizedkeysfile" {$1=""; sub(/^ /,""); print; exit}' <<<"${baseline}")"
+  [[ -n "${auth_values}" ]] || auth_values=".ssh/authorized_keys .ssh/authorized_keys2"
+  admin_has_key "${admin}" "${auth_values}" || {
+    printf 'Error: %s has no usable key in the current or safe_ssh authorization files; refusing possible lockout\n' "${admin}" >&2
+    return 1
+  }
+  phase server_login_probe
+  admin_login_probe "${admin}" || {
+    printf 'Error: public-key login probe for %s failed; refusing possible lockout\n' "${admin}" >&2
+    return 1
+  }
+  if [[ " ${auth_values} " != *" .safe_ssh/authorized_keys "* ]]; then
+    auth_values+=" .safe_ssh/authorized_keys"
+  fi
+  prior="$(mktemp "${SSHD_CONFIG_DIR}/.safe_ssh.rollback.XXXXXX")"
+  cp -p "${OWNED_SSHD_CONFIG}" "${prior}"
+  phase server_write
+  {
+    printf '%s\n%s\n' "${OWNED_HEADER}" "${ENABLED_MARKER}"
     printf 'PubkeyAuthentication yes\n'
     printf 'PasswordAuthentication no\n'
     printf 'KbdInteractiveAuthentication no\n'
@@ -518,19 +642,19 @@ server_on() {
   phase server_validate
   if ! "${SSHD_BIN}" -t; then
     phase rollback
-    if ((had_prior)); then mv -f "${prior}" "${OWNED_SSHD_CONFIG}"; else rm -f "${OWNED_SSHD_CONFIG}"; fi
+    mv -f "${prior}" "${OWNED_SSHD_CONFIG}"
     return 1
   fi
-  if ! server_policy_all_contexts_effective "${admin:-${INITIATOR_USER}}"; then
+  if ! server_policy_all_contexts_effective "${admin}"; then
     printf 'Error: safe_ssh policy is not effective in all checked SSH connection contexts; check Include ordering and Match blocks\n' >&2
     phase rollback
-    if ((had_prior)); then mv -f "${prior}" "${OWNED_SSHD_CONFIG}"; else rm -f "${OWNED_SSHD_CONFIG}"; fi
+    mv -f "${prior}" "${OWNED_SSHD_CONFIG}"
     return 1
   fi
   phase server_reload
   if ! reload_sshd; then
     phase rollback
-    if ((had_prior)); then mv -f "${prior}" "${OWNED_SSHD_CONFIG}"; else rm -f "${OWNED_SSHD_CONFIG}"; fi
+    mv -f "${prior}" "${OWNED_SSHD_CONFIG}"
     "${SSHD_BIN}" -t && reload_sshd || true
     return 1
   fi
@@ -571,24 +695,29 @@ server_status() {
   require_root server_status
   shift
   (($# == 0)) || { printf 'Error: server_status takes no arguments\n' >&2; return 2; }
-  local effective pub pass kbd methods auth owned=no service=inactive state=disabled
+  local effective pub pass kbd methods auth owned=no owned_state="" service=inactive state=disabled
   effective="$(sshd_effective)" || { printf 'server: unavailable\n'; return 1; }
   pub="$(awk 'tolower($1)=="pubkeyauthentication"{print tolower($2);exit}' <<<"${effective}")"
   pass="$(awk 'tolower($1)=="passwordauthentication"{print tolower($2);exit}' <<<"${effective}")"
   kbd="$(awk 'tolower($1)=="kbdinteractiveauthentication"{print tolower($2);exit}' <<<"${effective}")"
   methods="$(awk 'tolower($1)=="authenticationmethods"{$1="";sub(/^ /,"");print tolower($0);exit}' <<<"${effective}")"
   auth="$(awk 'tolower($1)=="authorizedkeysfile"{$1="";sub(/^ /,"");print;exit}' <<<"${effective}")"
-  [[ -f "${OWNED_SSHD_CONFIG}" ]] && grep -Fqx "${OWNED_HEADER}" "${OWNED_SSHD_CONFIG}" && owned=yes
+  owned_state="$(owned_server_state 2>/dev/null || true)"
+  [[ -n "${owned_state}" ]] && owned=yes
   sshd_service_active && service=active
-  if [[ "${owned}" == yes && "${service}" == active ]] &&
-     server_policy_effective "${effective}" &&
-     server_policy_all_contexts_effective "${INITIATOR_USER}"; then
-    state=enabled
+  if [[ "${owned_state}" == enabled && "${service}" == active ]] &&
+       server_policy_effective "${effective}" &&
+       server_policy_all_contexts_effective "${INITIATOR_USER}"; then
+      state=enabled
+  elif [[ "${owned_state}" == prepared && "${service}" == active ]] &&
+       server_prerequisites_effective "${effective}" &&
+       server_prerequisites_all_contexts_effective "${INITIATOR_USER}"; then
+      state=prepared
   fi
   printf 'server: %s (service=%s, owned_dropin=%s, pubkey=%s, password=%s, keyboard_interactive=%s, authentication_methods=%s, authorized_keys=%s)\n' \
     "${state}" "${service}" "${owned}" "${pub:-unknown}" "${pass:-unknown}" "${kbd:-unknown}" \
     "${methods:-unknown}" "${auth:-unknown}"
-  [[ "${state}" == enabled ]]
+  [[ "${state}" == enabled || "${state}" == prepared ]]
 }
 
 client_root() {
@@ -786,7 +915,7 @@ REMOTE
 }
 
 client_add() {
-  local name="${2:-}" target="${3:-}" port=22 bootstrap="" root dir profile key public fingerprint known snippet remote_key target_host ssh_target existing=0 authorized=0 authorization_completed=0
+  local name="${2:-}" target="${3:-}" port=22 bootstrap="" root dir profile key public fingerprint known snippet remote_key target_host ssh_target authorization_completed=0
   [[ -n "${name}" && -n "${target}" ]] || { usage; return 2; }
   validate_name "${name}"
   validate_target "${target}"
@@ -814,7 +943,6 @@ client_add() {
     return 1
   fi
   if [[ -f "${profile}" ]]; then
-    existing=1
     [[ -f "${key}" && -f "${public}" && -f "${known}" ]] || {
       printf 'Error: incomplete client profile: %s\n' "${name}" >&2
       return 1
@@ -843,47 +971,22 @@ client_add() {
   fi
   fingerprint="$(ssh-keygen -lf "${public}" | awk '{print $2}')"
   printf 'key_type=ssh-ed25519 key_fingerprint=%s\n' "${fingerprint}"
-  if ((existing)); then
-    phase dedicated_verify
-    ssh_common_args "${known}"
-    if ssh "${SSH_ARGS[@]}" -p "${port}" -i "${key}" -o IdentitiesOnly=yes \
-      -o BatchMode=yes -o PreferredAuthentications=publickey \
-      -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
-      -o ChallengeResponseAuthentication=no -o GSSAPIAuthentication=no \
-      -o HostbasedAuthentication=no -o NumberOfPasswordPrompts=0 \
-      -o "HostName=${target_host}" \
-      -o ControlMaster=no -o ControlPath=none \
-      "${ssh_target}" true; then
-      authorized=1
-      authorization_completed=1
-    fi
+  ssh_common_args "${known}"
+  SSH_ARGS+=(-p "${port}" -o "HostName=${target_host}" \
+    -o ControlMaster=no -o ControlPath=none)
+  if [[ -n "${bootstrap}" ]]; then
+    SSH_ARGS+=(-i "${bootstrap}" -o IdentitiesOnly=yes)
+  else
+    SSH_ARGS+=(-i "${key}")
   fi
-  if ((!authorized)); then
-    ssh_common_args "${known}"
-    SSH_ARGS+=(-p "${port}" -o "HostName=${target_host}" \
-      -o ControlMaster=no -o ControlPath=none)
-    [[ -z "${bootstrap}" ]] || SSH_ARGS+=(-i "${bootstrap}" -o IdentitiesOnly=yes)
-    phase remote_authorize
-    printf -v remote_key '%q' "$(cat "${public}")"
-    remote_add_script | ssh "${SSH_ARGS[@]}" "${ssh_target}" bash -s -- "${remote_key}"
-    authorization_completed=1
-  fi
+  phase remote_authorize
+  printf -v remote_key '%q' "$(cat "${public}")"
+  remote_add_script | ssh "${SSH_ARGS[@]}" "${ssh_target}" bash -s -- "${remote_key}"
+  authorization_completed=1
   if ((authorization_completed)); then
     {
       printf 'TARGET=%s\nPORT=%s\nAUTHORIZATION_COMPLETED=1\n' "${target}" "${port}"
     } | write_atomic "${profile}" 600
-  fi
-  if ((!authorized)); then
-    phase dedicated_verify
-    ssh_common_args "${known}"
-    ssh "${SSH_ARGS[@]}" -p "${port}" -i "${key}" -o IdentitiesOnly=yes \
-      -o BatchMode=yes -o PreferredAuthentications=publickey \
-      -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
-      -o ChallengeResponseAuthentication=no -o GSSAPIAuthentication=no \
-      -o HostbasedAuthentication=no -o NumberOfPasswordPrompts=0 \
-      -o "HostName=${target_host}" \
-      -o ControlMaster=no -o ControlPath=none \
-      "${ssh_target}" true
   fi
   {
     printf '%s\n' "${OWNED_HEADER}"
@@ -903,7 +1006,7 @@ client_add() {
     printf '  StrictHostKeyChecking ask\n'
   } | write_atomic "${snippet}" 600
   install_include
-  printf 'client %s ready as Host safe-ssh-%s\n' "${name}" "${name}"
+  printf 'client %s configured as Host safe-ssh-%s\n' "${name}" "${name}"
 }
 
 load_profile() {
@@ -930,6 +1033,47 @@ load_profile() {
     return 1
   }
   CLIENT_DIR="${dir}"
+}
+
+strict_client_probe() {
+  local target_host ssh_target
+  target_host="${TARGET#*@}"
+  target_host="${target_host#[}"
+  target_host="${target_host%]}"
+  ssh_target="${TARGET%@*}@${target_host}"
+  LC_ALL=C ssh -n -F /dev/null \
+    -p "${PORT}" -i "${CLIENT_DIR}/id_ed25519" \
+    -o IdentitiesOnly=yes \
+    -o BatchMode=yes \
+    -o PreferredAuthentications=publickey \
+    -o PasswordAuthentication=no \
+    -o KbdInteractiveAuthentication=no \
+    -o ChallengeResponseAuthentication=no \
+    -o GSSAPIAuthentication=no \
+    -o HostbasedAuthentication=no \
+    -o NumberOfPasswordPrompts=0 \
+    -o ConnectTimeout=5 \
+    -o "UserKnownHostsFile=${CLIENT_DIR}/known_hosts" \
+    -o StrictHostKeyChecking=ask \
+    -o GlobalKnownHostsFile=/dev/null \
+    -o "HostName=${target_host}" \
+    -o ControlMaster=no \
+    -o ControlPath=none \
+    "${ssh_target}" true
+}
+
+client_test() {
+  local name="${2:-}" output
+  (($# == 2)) && [[ -n "${name}" ]] || { usage; return 2; }
+  load_profile "${name}" || return 1
+  phase dedicated_test
+  if output="$(strict_client_probe 2>&1)"; then
+    [[ -z "${output}" ]] || printf '%s\n' "${output}"
+    printf 'client %s connection verified.\n' "${name}"
+  else
+    [[ -z "${output}" ]] || printf '%s\n' "${output}" >&2
+    return 1
+  fi
 }
 
 client_delete() {
@@ -1034,7 +1178,7 @@ status_one() {
     printf '%s: local-only (%s)\n' "${name}" "${TARGET}"
     return 1
   fi
-  if output="$(LC_ALL=C ssh -n -o BatchMode=yes -o ConnectTimeout=5 "${alias}" true 2>&1)"; then
+  if output="$(strict_client_probe 2>&1)"; then
     [[ -z "${output}" ]] || printf '%s\n' "${output}"
     printf '%s: ready (%s)\n' "${name}" "${TARGET}"
   else
@@ -1073,10 +1217,12 @@ main() {
   init_log "$@"
   local command="${1:-}"
   case "${command}" in
+    server_prepare) server_prepare "$@" ;;
     server_on) server_on "$@" ;;
     server_off) server_off "$@" ;;
     server_status) server_status "$@" ;;
     client_add) require_unprivileged_client; client_add "$@" ;;
+    client_test) require_unprivileged_client; client_test "$@" ;;
     client_delete) require_unprivileged_client; client_delete "$@" ;;
     client_status) require_unprivileged_client; client_status "$@" ;;
     -h|--help|help|"") usage ;;

@@ -46,12 +46,16 @@ if [[ "$1" == -T ]]; then
   printf 'pubkeyauthentication yes\n'
   if [[ -f "${TEST_SSHD_DIR}/00-safe-ssh.conf" &&
         "${TEST_SSHD_IGNORE_DROPIN:-0}" != 1 ]]; then
+    password="$(awk 'tolower($1)=="passwordauthentication"{print tolower($2);exit}' "${TEST_SSHD_DIR}/00-safe-ssh.conf")"
+    kbd="$(awk 'tolower($1)=="kbdinteractiveauthentication"{print tolower($2);exit}' "${TEST_SSHD_DIR}/00-safe-ssh.conf")"
+    methods="$(awk 'tolower($1)=="authenticationmethods"{$1="";sub(/^ /,"");print tolower($0);exit}' "${TEST_SSHD_DIR}/00-safe-ssh.conf")"
     if [[ "${TEST_SSHD_MATCH_WEAK:-0}" == 1 && " $* " == *" -C "* ]]; then
-      printf 'passwordauthentication yes\nkbdinteractiveauthentication yes\n'
-    else
-      printf 'passwordauthentication no\nkbdinteractiveauthentication no\n'
+      password=yes
+      kbd=yes
     fi
-    printf 'authenticationmethods publickey\n'
+    printf 'passwordauthentication %s\n' "${password:-yes}"
+    printf 'kbdinteractiveauthentication %s\n' "${kbd:-yes}"
+    printf 'authenticationmethods %s\n' "${methods:-any}"
     awk 'tolower($1)=="authorizedkeysfile"{print tolower($0)}' "${TEST_SSHD_DIR}/00-safe-ssh.conf"
   else
     printf 'passwordauthentication yes\nkbdinteractiveauthentication yes\n'
@@ -103,7 +107,8 @@ set -euo pipefail
 printf '%q ' "$@" >>"${TEST_SSH_CALLS}"
 printf '\n' >>"${TEST_SSH_CALLS}"
 if [[ " $* " == *" PreferredAuthentications=publickey "* &&
-      "${TEST_SSH_LOGIN_PROBE_FAIL:-0}" == 1 ]]; then
+      ( "${TEST_CLIENT_TEST_FAIL:-0}" == 1 ||
+        "${TEST_SSH_LOGIN_PROBE_FAIL:-0}" == 1 ) ]]; then
   exit 255
 fi
 if [[ "${1:-}" == -G ]]; then
@@ -177,6 +182,7 @@ export PATH="${tmp_dir}/bin:${PATH}"
 export HOME="${home}"
 export XDG_CONFIG_HOME="${home}/.config"
 mkdir -p "${TEST_REMOTE_HOME}"
+: >"${TEST_SSH_CALLS}"
 printf 'Include %s/*.conf\n' "${TEST_SSHD_DIR}" >"${TEST_SSHD_CONFIG}"
 
 # Executable injection hooks exist only behind the non-root test boundary.
@@ -216,15 +222,20 @@ set -e
 [[ "$(stat -c %a "${symlink_target}")" == 755 ]] ||
   fail "symlink target mode was changed"
 
-# Server lifecycle preserves the baseline AuthorizedKeysFile values and touches
-# only the owned drop-in.
+# Server preparation preserves AuthorizedKeysFile values, enables only the
+# prerequisites for client key installation, and touches only the owned file.
 mkdir -p "${TEST_SSHD_DIR}"
 printf 'leave me\n' >"${TEST_SSHD_DIR}/90-unrelated.conf"
 TEST_SSHD_VERSION_EXIT=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --force >/dev/null
-assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "PasswordAuthentication no"
+  "${script}" server_prepare >/dev/null
+assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: prepared"
+assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "PubkeyAuthentication yes"
 assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" \
   "AuthorizedKeysFile .ssh/authorized_keys .ssh/custom_keys .safe_ssh/authorized_keys"
+if grep -Eq '^(PasswordAuthentication|KbdInteractiveAuthentication|AuthenticationMethods) ' \
+    "${TEST_SSHD_DIR}/00-safe-ssh.conf"; then
+  fail "server_prepare hardened authentication"
+fi
 assert_file_contains "${TEST_SSHD_DIR}/90-unrelated.conf" "leave me"
 set +e
 status_output="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=1000 "${script}" server_status)"
@@ -233,15 +244,67 @@ set -e
 [[ "${status}" -ne 0 ]] || fail "unprivileged server_status was accepted"
 assert_contains "${status_output}" "server_status requires root"
 status_output="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_status)"
-assert_contains "${status_output}" "server: enabled"
+assert_contains "${status_output}" "server: prepared"
+
+# Preparation is idempotent, and enabling is unavailable without preparation.
+prepared_checksum="$(sha256sum "${TEST_SSHD_DIR}/00-safe-ssh.conf")"
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_prepare >/dev/null
+[[ "$(sha256sum "${TEST_SSHD_DIR}/00-safe-ssh.conf")" == "${prepared_checksum}" ]] ||
+  fail "server_prepare was not idempotent"
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
+set +e
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "server_on did not require preparation"
+set +e
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on --force >/dev/null
+status=$?
+set -e
+[[ "${status}" == 2 ]] || fail "server_on --force was not rejected as usage"
+
+# Preparation validates and reloads atomically.
+set +e
+TEST_SSHD_FAIL_VALIDATE=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_prepare >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "server_prepare validation failure did not roll back"
+set +e
+TEST_SYSTEMCTL_FAIL=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_prepare >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "server_prepare reload failure did not roll back"
+
+# Preparation rejects user-specific Match blocks that could override key
+# authentication for an intended client account.
+match_config="${tmp_dir}/match-client.conf"
+printf '%s\n' \
+  'Match User client-user' \
+  '    PubkeyAuthentication no' \
+  '    AuthorizedKeysFile none' >"${match_config}"
+set +e
+TEST_SSHD_EXTRA_CONFIG="${match_config}" SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_prepare >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "server_prepare accepted a user-specific Match block"
+
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_prepare >/dev/null
+
 set +e
 status_output="$(TEST_SSHD_MATCH_WEAK=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
   "${script}" server_status)"
 status=$?
 set -e
-[[ "${status}" -ne 0 ]] || fail "matched weak authentication policy reported enabled"
-assert_contains "${status_output}" "server: disabled"
-assert_file_contains "${TEST_SSHD_CALLS}" "-T -C"
+[[ "${status}" -eq 0 ]] || fail "prepared state rejected permissive authentication"
+assert_contains "${status_output}" "server: prepared"
 set +e
 status_output="$(TEST_SYSTEMCTL_INACTIVE=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
   "${script}" server_status)"
@@ -249,71 +312,6 @@ status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "inactive SSH service reported enabled"
 assert_contains "${status_output}" "service=inactive"
-
-# Validation failure rolls back the owned file while preserving unrelated data.
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
-set +e
-TEST_SSHD_MATCH_WEAK=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --force >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "server_on accepted a weak matched connection context"
-set +e
-TEST_SSHD_FAIL_VALIDATE=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --force >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "server_on validation failure did not roll back"
-assert_file_contains "${TEST_SSHD_DIR}/90-unrelated.conf" "leave me"
-set +e
-TEST_SYSTEMCTL_FAIL=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --force >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "server_on reload failure did not roll back"
-set +e
-TEST_SSHD_IGNORE_DROPIN=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --force >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "server_on accepted an ineffective drop-in"
-
-printf 'Match User special\n  PasswordAuthentication yes\n' \
-  >"${TEST_SSHD_DIR}/90-match.conf"
-set +e
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --force >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "server_on accepted a matched authentication override"
-rm -f "${TEST_SSHD_DIR}/90-match.conf"
-
-# Match blocks in nested, arbitrary, or symlinked includes are also rejected.
-mkdir -p "${tmp_dir}/external"
-printf 'Match User nested\n  PasswordAuthentication yes\n' \
-  >"${tmp_dir}/external/nested.conf"
-set +e
-TEST_SSHD_EXTRA_CONFIG="${tmp_dir}/external/nested.conf" \
-  SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --force >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "server_on accepted a Match block in an arbitrary nested include"
-ln -s "${tmp_dir}/external/nested.conf" "${TEST_SSHD_DIR}/90-linked.conf"
-set +e
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --force >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "server_on accepted a Match block through a symlinked include"
-rm -f "${TEST_SSHD_DIR}/90-linked.conf"
 
 # A malformed key is not sufficient to risk disabling password access.
 mkdir -p "${home}/.ssh"
@@ -338,19 +336,39 @@ set -e
 [[ "${status}" -ne 0 ]] || fail "conditional administrator key was accepted"
 
 printf 'ssh-ed25519 AAAA_EXISTING admin\n' >"${home}/.ssh/authorized_keys"
+ssh_calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
   "${script}" server_on --admin-user tester >/dev/null
-assert_file_contains "${TEST_SSH_CALLS}" "PreferredAuthentications=publickey"
-assert_file_contains "${TEST_SSH_CALLS}" "-F /dev/null"
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
+[[ "$(wc -l <"${TEST_SSH_CALLS}")" == "$((ssh_calls_before + 1))" ]] ||
+  fail "server_on did not perform exactly one administrator login probe"
+login_probe_call="$(tail -1 "${TEST_SSH_CALLS}")"
+assert_contains "${login_probe_call}" "PreferredAuthentications=publickey"
+assert_contains "${login_probe_call}" "PasswordAuthentication=no"
+assert_contains "${login_probe_call}" "-l tester"
+assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: enabled"
+assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "PasswordAuthentication no"
+status_output="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_status)"
+assert_contains "${status_output}" "server: enabled"
 
+# Re-enabling is idempotent. A failed first enable restores prepared state.
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_prepare >/dev/null
 set +e
 TEST_SSH_LOGIN_PROBE_FAIL=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
   "${script}" server_on --admin-user tester >/dev/null
 status=$?
 set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "failed administrator login probe changed the server policy"
+[[ "${status}" -ne 0 ]] || fail "server_on accepted a failed administrator login probe"
+assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: prepared"
+set +e
+TEST_SSHD_MATCH_WEAK=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on accepted a weak matched context"
+assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: prepared"
 
 chmod 777 "${home}/.ssh"
 set +e
@@ -361,9 +379,53 @@ set -e
 [[ "${status}" -ne 0 ]] || fail "key beneath a writable SSH directory was accepted"
 chmod 755 "${home}/.ssh"
 
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on --force >/dev/null
+# Enabling validation and reload failures both restore prepared state.
+set +e
+TEST_SSHD_FAIL_VALIDATE=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on accepted invalid sshd configuration"
+assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: prepared"
+set +e
+TEST_SYSTEMCTL_FAIL=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on ignored reload failure"
+assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: prepared"
+
+# Preparing an enabled server never weakens it.
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_prepare >/dev/null
+assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: enabled"
+assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "PasswordAuthentication no"
 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
 [[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] || fail "server_off left owned drop-in"
+
+# A pre-marker owned full-policy drop-in remains recognized as enabled.
+{
+  printf '%s\n' '# Managed by safe_ssh.sh; do not edit.'
+  printf '%s\n' \
+    'PubkeyAuthentication yes' \
+    'PasswordAuthentication no' \
+    'KbdInteractiveAuthentication no' \
+    'AuthenticationMethods publickey' \
+    'AuthorizedKeysFile .ssh/authorized_keys .safe_ssh/authorized_keys'
+} >"${TEST_SSHD_DIR}/00-safe-ssh.conf"
+status_output="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_status)"
+assert_contains "${status_output}" "server: enabled"
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: enabled"
+set +e
+TEST_SSHD_IGNORE_DROPIN=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on trusted an ineffective enabled marker"
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
 
 # Clients use independent keys/known_hosts and a single marked Include without
 # disturbing an unrelated SSH host.
@@ -428,19 +490,14 @@ assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/alpha.conf" \
 assert_file_contains "${home}/.ssh/config" "Host * # safe_ssh managed scope reset"
 assert_file_contains "${home}/.ssh/config" "ServerAliveInterval 30"
 assert_file_contains "${home}/.ssh/config" "Host existing"
-assert_file_contains "${TEST_SSH_CALLS}" "IdentitiesOnly=yes"
 assert_file_contains "${TEST_SSH_CALLS}" "UserKnownHostsFile=${alpha}/known_hosts"
-dedicated_calls="$(grep 'id_ed25519 .* true $' "${TEST_SSH_CALLS}")"
-[[ -n "${dedicated_calls}" ]] || fail "missing dedicated-key verification call"
-while IFS= read -r call; do
-  assert_contains "${call}" "PreferredAuthentications=publickey"
-  assert_contains "${call}" "PasswordAuthentication=no"
-  assert_contains "${call}" "KbdInteractiveAuthentication=no"
-  assert_contains "${call}" "ChallengeResponseAuthentication=no"
-  assert_contains "${call}" "GSSAPIAuthentication=no"
-  assert_contains "${call}" "HostbasedAuthentication=no"
-  assert_contains "${call}" "NumberOfPasswordPrompts=0"
-done <<<"${dedicated_calls}"
+if grep -q 'id_ed25519 .* true $' "${TEST_SSH_CALLS}"; then
+  fail "client_add performed a dedicated-key verification"
+fi
+alpha_authorize_call="$(grep "${alpha}/id_ed25519" "${TEST_SSH_CALLS}" | grep 'bash -s --' | head -1)"
+assert_contains "${alpha_authorize_call}" "-i ${alpha}/id_ed25519"
+[[ "${alpha_authorize_call}" != *"IdentitiesOnly=yes"* ]] ||
+  fail "default authorization prevented fallback identities"
 assert_file_contains "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys" \
   "ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_alpha safe_ssh:alpha"
 [[ "$(stat -c %a "${TEST_REMOTE_HOME}/.safe_ssh")" == 700 ]] ||
@@ -474,12 +531,40 @@ calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
 "${script}" client_add alpha alice@example.test --port 2222 >/dev/null
 retry_calls="$(tail -n "+$((calls_before + 1))" "${TEST_SSH_CALLS}")"
 [[ "$(wc -l <<<"${retry_calls}")" == 1 ]] ||
-  fail "existing profile retry did not use only dedicated verification"
-[[ "${retry_calls}" != *"bash -s --"* && "${retry_calls}" == *"BatchMode=yes"* ]] ||
-  fail "existing profile retry fell back to bootstrap authorization"
+  fail "existing profile retry made unexpected SSH calls"
+[[ "${retry_calls}" == *"bash -s --"* ]] ||
+  fail "existing profile retry did not repeat exact authorization"
 assert_contains "${retry_calls}" "ControlMaster=no"
 assert_contains "${retry_calls}" "ControlPath=none"
 assert_contains "${retry_calls}" "HostName=example.test"
+[[ "$(grep -Fc 'safe_ssh:alpha' "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys")" == 1 ]] ||
+  fail "existing profile retry duplicated the remote key"
+
+# Connection proof is an explicit, strict dedicated-key command.
+calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
+test_output="$("${script}" client_test alpha)"
+assert_contains "${test_output}" "client alpha connection verified."
+test_call="$(tail -n "+$((calls_before + 1))" "${TEST_SSH_CALLS}")"
+assert_contains "${test_call}" "-i ${alpha}/id_ed25519"
+assert_contains "${test_call}" "IdentitiesOnly=yes"
+assert_contains "${test_call}" "BatchMode=yes"
+assert_contains "${test_call}" "PreferredAuthentications=publickey"
+assert_contains "${test_call}" "PasswordAuthentication=no"
+assert_contains "${test_call}" "KbdInteractiveAuthentication=no"
+assert_contains "${test_call}" "NumberOfPasswordPrompts=0"
+assert_contains "${test_call}" "ControlMaster=no"
+assert_contains "${test_call}" "ControlPath=none"
+assert_contains "${test_call}" "UserKnownHostsFile=${alpha}/known_hosts"
+set +e
+TEST_CLIENT_TEST_FAIL=1 "${script}" client_test alpha >/dev/null
+status=$?
+set -e
+[[ "${status}" == 1 ]] || fail "client_test connection failure did not exit 1"
+set +e
+"${script}" client_test >/dev/null
+status=$?
+set -e
+[[ "${status}" == 2 ]] || fail "client_test usage error did not exit 2"
 
 set +e
 "${script}" client_add alpha alice@different.test >/dev/null

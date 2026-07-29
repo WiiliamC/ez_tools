@@ -10,20 +10,27 @@ limited to Ubuntu/Debian systems using systemd and OpenSSH. It never edits
 `~/.safe_ssh/authorized_keys`.
 
 ```bash
-# On the server. The named administrator must already have a usable key in an
-# existing AuthorizedKeysFile or ~/.safe_ssh/authorized_keys. Enabling performs
-# a public-key login probe, so its private key or forwarded agent must be
-# available to the sudo invocation.
-sudo ./safe_ssh.sh server_on --admin-user alice
-sudo ./safe_ssh.sh server_on --force
-sudo ./safe_ssh.sh server_status
-sudo ./safe_ssh.sh server_off
+# 1. On the server, allow safe_ssh client keys without disabling existing
+# password or keyboard-interactive authentication.
+sudo ./safe_ssh.sh server_prepare
 
-# On the client.
-# Run client commands as the login user, never through sudo.
+# 2. On the client, as the login user (never through sudo), install a dedicated
+# key using existing SSH access.
 ./safe_ssh.sh client_add home alice@ssh.example.com --port 2222
 ./safe_ssh.sh client_add home alice@ssh.example.com \
   --port 2222 --bootstrap-identity ~/.ssh/existing_key
+
+# 3. Prove that the dedicated key can connect without fallback authentication.
+./safe_ssh.sh client_test home
+
+# 4. Back on the server, require public-key authentication. The administrator
+# must have a safe, usable key in an effective AuthorizedKeysFile, and its
+# private key or forwarded agent must be available to the sudo invocation for
+# a public-key login probe.
+sudo ./safe_ssh.sh server_on --admin-user alice
+
+sudo ./safe_ssh.sh server_status
+sudo ./safe_ssh.sh server_off
 ./safe_ssh.sh client_status
 ./safe_ssh.sh client_status home
 ./safe_ssh.sh client_delete home
@@ -41,13 +48,14 @@ key mismatch is refused and is never automatically replaced.
 or `unauthorized` so local configuration failures can be distinguished from
 network and authentication failures.
 
-`client_add` uses your existing SSH access once to install the new public key,
-then verifies that the dedicated identity works. Repeating the same name and
-target is safe; reusing a name for another target is refused. `client_delete`
-revokes the exact public key remotely before deleting local files, so local
-recovery state is retained if revocation fails. If initial authorization never
-succeeded and the target cannot be reached, `client_delete NAME --local-only`
-explicitly removes only the local profile without attempting remote revocation.
+`client_add` uses your existing SSH access to install the new public key.
+`client_test` separately verifies that the dedicated identity works with
+public-key authentication only. Repeating the same name and target is safe;
+reusing a name for another target is refused. `client_delete` revokes the exact
+public key remotely before deleting local files, so local recovery state is
+retained if revocation fails. If initial authorization never succeeded and the
+target cannot be reached, `client_delete NAME --local-only` explicitly removes
+only the local profile without attempting remote revocation.
 
 The aliases work with standard tools:
 
