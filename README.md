@@ -34,6 +34,8 @@ satisfied or the configured loop limit is reached.
 ```bash
 ./review_untill_satisfied.sh --repo ../my-project/
 ./review_untill_satisfied.sh --repo ../my-project/ --fast
+./review_untill_satisfied.sh --resume /path/to/original-run.log
+./review_untill_satisfied.sh --repo ../my-project/ --resume
 ```
 
 The script explicitly uses the default Codex service tier, even if Fast is
@@ -47,6 +49,21 @@ cannot treat the active log as a repository artifact or delete it. You can
 override the location with `--log-dir PATH`, but the resolved path must remain
 outside the target repository. Existing logs from older versions are not moved
 or deleted automatically.
+
+Every new log has private `.state.json`, `.review.json`, and `.events.jsonl`
+sidecars. They preserve loop/phase checkpoints, structured review output, the
+raw Codex event stream, and the Codex session needed to continue a failed or
+interrupted phase. `--resume LOG` appends to that original log. Bare `--resume`
+selects the newest incomplete run for the repository (and searches `--log-dir`
+when one is provided). Logs created before these sidecars were introduced
+cannot be resumed.
+
+Resume rejects repository changes made after the saved checkpoint by default.
+Use `--allow-worktree-changes` only after checking that the drift is expected.
+The saved service tier is always reused, so `--fast` is not accepted on resume.
+`--max-loops` may keep or increase the original total, but never reduce it; an
+exhausted run requires a larger total before it can continue. Each run is
+locked so only one process can resume it at a time.
 
 ## daily_task.sh
 
