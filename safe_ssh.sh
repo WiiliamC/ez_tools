@@ -1233,6 +1233,12 @@ status_one() {
   identities_only="$(awk '$1=="identitiesonly"{print $2; exit}' <<<"${effective}")"
   control_master="$(awk '$1=="controlmaster"{print $2; exit}' <<<"${effective}")"
   control_path="$(awk '$1=="controlpath"{$1=""; sub(/^ /,""); print; exit}' <<<"${effective}")"
+  case "${control_master}" in
+    false|no) control_master=no ;;
+  esac
+  case "${control_path}" in
+    "") control_path=none ;;
+  esac
   preferred="$(awk '$1=="preferredauthentications"{print $2; exit}' <<<"${effective}")"
   password="$(awk '$1=="passwordauthentication"{print $2; exit}' <<<"${effective}")"
   kbd="$(awk '$1=="kbdinteractiveauthentication"{print $2; exit}' <<<"${effective}")"

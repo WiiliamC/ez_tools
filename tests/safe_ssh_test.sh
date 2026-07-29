@@ -132,8 +132,20 @@ if [[ "${1:-}" == -G ]]; then
     $1=="Port" {print "port " $2}
     $1=="IdentityFile" {print "identityfile " value()}
     $1=="IdentitiesOnly" {print "identitiesonly " tolower($2)}
-    $1=="ControlMaster" {print "controlmaster " tolower($2)}
-    $1=="ControlPath" {print "controlpath " value()}
+    $1=="ControlMaster" {
+      setting=tolower($2)
+      if (ENVIRON["TEST_SSH_G_LITERAL_DISABLED"] != "1" && setting=="no") {
+        setting="false"
+      }
+      print "controlmaster " setting
+    }
+    $1=="ControlPath" {
+      setting=value()
+      if (ENVIRON["TEST_SSH_G_LITERAL_DISABLED"] == "1" ||
+          tolower(setting)!="none") {
+        print "controlpath " setting
+      }
+    }
     $1=="PreferredAuthentications" {print "preferredauthentications " tolower($2)}
     $1=="PasswordAuthentication" {print "passwordauthentication " tolower($2)}
     $1=="KbdInteractiveAuthentication" {print "kbdinteractiveauthentication " tolower($2)}
@@ -631,6 +643,8 @@ set -e
 status_output="$("${script}" client_status)"
 assert_contains "${status_output}" "alpha: ready"
 assert_contains "${status_output}" "beta: ready"
+status_output="$(TEST_SSH_G_LITERAL_DISABLED=1 "${script}" client_status alpha)"
+assert_contains "${status_output}" "alpha: ready"
 set +e
 status_output="$(TEST_SSH_LOCALE_PROBE=1 "${script}" client_status alpha)"
 status=$?
