@@ -2,6 +2,81 @@
 
 A collection of utility tools for Linux systems.
 
+## safe_ssh.sh
+
+Creates isolated, public-key-only SSH access profiles. Server management is
+limited to Ubuntu/Debian systems using systemd and OpenSSH. It never edits
+`~/.ssh/authorized_keys`: server-side keys are kept in
+`~/.safe_ssh/authorized_keys`.
+
+```bash
+# On the server. The named administrator must already have a usable key in an
+# existing AuthorizedKeysFile or ~/.safe_ssh/authorized_keys. Enabling performs
+# a public-key login probe, so its private key or forwarded agent must be
+# available to the sudo invocation.
+sudo ./safe_ssh.sh server_on --admin-user alice
+sudo ./safe_ssh.sh server_on --force
+sudo ./safe_ssh.sh server_status
+sudo ./safe_ssh.sh server_off
+
+# On the client.
+# Run client commands as the login user, never through sudo.
+./safe_ssh.sh client_add home alice@ssh.example.com --port 2222
+./safe_ssh.sh client_add home alice@ssh.example.com \
+  --port 2222 --bootstrap-identity ~/.ssh/existing_key
+./safe_ssh.sh client_status
+./safe_ssh.sh client_status home
+./safe_ssh.sh client_delete home
+./safe_ssh.sh client_delete home --local-only
+```
+
+Each client name gets its own unencrypted Ed25519 key, dedicated `known_hosts`,
+metadata, and `Host safe-ssh-NAME` snippet under
+`${XDG_CONFIG_HOME:-$HOME/.config}/safe_ssh/`. The one marked `Include` at the
+top of `~/.ssh/config` exposes those aliases without changing unrelated hosts
+or identity selection. First use asks you to confirm the host key. A later host
+key mismatch is refused and is never automatically replaced.
+
+`client_status` reports `ready`, `local-only`, `host-key-error`, `unreachable`,
+or `unauthorized` so local configuration failures can be distinguished from
+network and authentication failures.
+
+`client_add` uses your existing SSH access once to install the new public key,
+then verifies that the dedicated identity works. Repeating the same name and
+target is safe; reusing a name for another target is refused. `client_delete`
+revokes the exact public key remotely before deleting local files, so local
+recovery state is retained if revocation fails. If initial authorization never
+succeeded and the target cannot be reached, `client_delete NAME --local-only`
+explicitly removes only the local profile without attempting remote revocation.
+
+The aliases work with standard tools:
+
+```bash
+ssh safe-ssh-home
+scp ./backup.tar safe-ssh-home:/srv/backups/
+rclone copy ./photos :sftp:/data/photos \
+  --sftp-host ssh.example.com \
+  --sftp-user alice \
+  --sftp-port 2222 \
+  --sftp-key-file ~/.config/safe_ssh/clients/home/id_ed25519 \
+  --sftp-known-hosts-file ~/.config/safe_ssh/clients/home/known_hosts
+```
+
+For a cpolar TCP tunnel, start the tunnel on the SSH server (for example,
+`cpolar tcp 22`), then use the hostname and port shown by cpolar as the
+`USER@HOST` and `--port` values:
+
+```bash
+./safe_ssh.sh client_add tunneled alice@example.cpolar.cn --port 12345
+ssh safe-ssh-tunneled
+```
+
+Every invocation writes a complete private log under the initiating user's
+`~/.safe_ssh/logs/`. With `sudo`, that user and home are resolved from
+`SUDO_USER` via the passwd database. Logs contain phases, command output,
+rollback and exit status, but redact secrets and record only key type and
+fingerprint.
+
 ## until_success.sh
  
 Repeatedly executes a command until it succeeds.

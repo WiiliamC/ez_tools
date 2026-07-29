@@ -1,0 +1,653 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+script="${repo_root}/safe_ssh.sh"
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "${tmp_dir}"' EXIT
+
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+assert_contains() {
+  [[ "$1" == *"$2"* ]] || fail "expected '$2' in: $1"
+}
+
+assert_file_contains() {
+  grep -Fq -- "$2" "$1" || fail "expected '$2' in $1"
+}
+
+[[ -x "${script}" ]] || fail "safe_ssh.sh must exist and be executable"
+
+home="${tmp_dir}/home"
+mkdir -p "${home}" "${tmp_dir}/bin"
+chmod 700 "${home}"
+cat >"${tmp_dir}/bin/getent" <<'EOF'
+#!/usr/bin/env bash
+printf '%s:x:%s:%s::%s:/bin/bash\n' "$2" "$(id -u)" "$(id -g)" "${TEST_HOME}"
+EOF
+cat >"${tmp_dir}/bin/sshd" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${TEST_SSHD_CALLS}"
+if [[ "$1" == -T ]]; then
+  if [[ " $* " == *" -ddd "* ]]; then
+    printf 'debug2: load_server_config: filename %s\n' "${TEST_SSHD_CONFIG}" >&2
+    while IFS= read -r file; do
+      printf 'debug2: load_server_config: filename %s\n' "${file}" >&2
+    done < <(find -L "${TEST_SSHD_DIR}" -type f | sort)
+    if [[ -n "${TEST_SSHD_EXTRA_CONFIG:-}" ]]; then
+      printf 'debug2: load_server_config: filename %s\n' "${TEST_SSHD_EXTRA_CONFIG}" >&2
+    fi
+  fi
+  printf 'pubkeyauthentication yes\n'
+  if [[ -f "${TEST_SSHD_DIR}/00-safe-ssh.conf" &&
+        "${TEST_SSHD_IGNORE_DROPIN:-0}" != 1 ]]; then
+    if [[ "${TEST_SSHD_MATCH_WEAK:-0}" == 1 && " $* " == *" -C "* ]]; then
+      printf 'passwordauthentication yes\nkbdinteractiveauthentication yes\n'
+    else
+      printf 'passwordauthentication no\nkbdinteractiveauthentication no\n'
+    fi
+    printf 'authenticationmethods publickey\n'
+    awk 'tolower($1)=="authorizedkeysfile"{print tolower($0)}' "${TEST_SSHD_DIR}/00-safe-ssh.conf"
+  else
+    printf 'passwordauthentication yes\nkbdinteractiveauthentication yes\n'
+    printf 'authenticationmethods any\n'
+    printf 'authorizedkeysfile .ssh/authorized_keys .ssh/custom_keys\n'
+  fi
+elif [[ "$1" == -t ]]; then
+  [[ "${TEST_SSHD_FAIL_VALIDATE:-0}" != 1 ]]
+elif [[ "$1" == -V ]]; then
+  printf 'OpenSSH_9.6p1\n' >&2
+  exit "${TEST_SSHD_VERSION_EXIT:-0}"
+fi
+EOF
+cat >"${tmp_dir}/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${TEST_SYSTEMCTL_CALLS}"
+if [[ "$*" == "is-active --quiet ssh.service" || "$*" == "is-active --quiet sshd.service" ]]; then
+  [[ "${TEST_SYSTEMCTL_INACTIVE:-0}" != 1 ]]
+  exit
+fi
+[[ "${TEST_SYSTEMCTL_FAIL:-0}" != 1 ]]
+EOF
+cat >"${tmp_dir}/bin/ssh-keygen" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == -lf ]]; then
+  [[ "$(cat "$2")" != *"ssh-ed25519 garbage"* ]] || exit 1
+  printf '256 SHA256:focused-fingerprint safe_ssh (ED25519)\n'
+  exit 0
+fi
+if [[ "$1" == -y && "$2" == -f ]]; then
+  name="$(basename "$(dirname "$3")")"
+  printf 'ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_%s\n' "${name}"
+  exit 0
+fi
+file=""
+while (($#)); do
+  if [[ "$1" == -f ]]; then file="$2"; shift 2; else shift; fi
+done
+printf '%s\n' 'PRIVATE-KEY-MUST-NOT-BE-LOGGED' >"${file}"
+name="$(basename "$(dirname "${file}")")"
+printf 'ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_%s safe_ssh:%s\n' \
+  "${name}" "${name}" >"${file}.pub"
+EOF
+cat >"${tmp_dir}/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%q ' "$@" >>"${TEST_SSH_CALLS}"
+printf '\n' >>"${TEST_SSH_CALLS}"
+if [[ " $* " == *" PreferredAuthentications=publickey "* &&
+      "${TEST_SSH_LOGIN_PROBE_FAIL:-0}" == 1 ]]; then
+  exit 255
+fi
+if [[ "${1:-}" == -G ]]; then
+  name="${2#safe-ssh-}"
+  snippet="${XDG_CONFIG_HOME}/safe_ssh/ssh_config.d/${name}.conf"
+  awk '
+    function value() {
+      $1=""
+      sub(/^ /, "")
+      if (substr($0, 1, 1) == "\"" && substr($0, length($0), 1) == "\"") {
+        return substr($0, 2, length($0) - 2)
+      }
+      return $0
+    }
+    $1=="HostName" {print "hostname " $2}
+    $1=="User" {print "user " $2}
+    $1=="Port" {print "port " $2}
+    $1=="IdentityFile" {print "identityfile " value()}
+    $1=="IdentitiesOnly" {print "identitiesonly " tolower($2)}
+    $1=="ControlMaster" {print "controlmaster " tolower($2)}
+    $1=="ControlPath" {print "controlpath " value()}
+    $1=="PreferredAuthentications" {print "preferredauthentications " tolower($2)}
+    $1=="PasswordAuthentication" {print "passwordauthentication " tolower($2)}
+    $1=="KbdInteractiveAuthentication" {print "kbdinteractiveauthentication " tolower($2)}
+    $1=="UserKnownHostsFile" {print "userknownhostsfile " value()}
+    $1=="GlobalKnownHostsFile" {print "globalknownhostsfile " value()}
+    $1=="StrictHostKeyChecking" {print "stricthostkeychecking " tolower($2)}
+  ' "${snippet}"
+  exit
+fi
+if [[ " $* " == *" -n "* && "${TEST_SSH_LOCALE_PROBE:-0}" == 1 ]]; then
+  if [[ "${LC_ALL:-}" == C ]]; then
+    printf 'Permission denied (publickey).\n' >&2
+  else
+    printf '权限被拒绝 (publickey).\n' >&2
+  fi
+  exit 255
+fi
+script_body=""
+[[ " $* " == *" -n "* ]] || script_body="$(cat)"
+if [[ "$*" == *"bash -s --"* && "${TEST_SSH_DELETE_FAIL:-0}" == 1 &&
+      "${script_body}" == *'key_blob='* ]]; then
+  exit 23
+fi
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  if [[ "${args[i]}" == bash && "${args[i+1]:-}" == -s ]]; then
+    remote_command="${args[*]:i}"
+    HOME="${TEST_REMOTE_HOME}" bash -c "${remote_command}" <<<"${script_body}"
+    exit
+  fi
+done
+EOF
+chmod +x "${tmp_dir}/bin/"*
+
+export TEST_HOME="${home}"
+export TEST_SSHD_DIR="${tmp_dir}/sshd_config.d"
+export TEST_SSHD_CONFIG="${tmp_dir}/sshd_config"
+export TEST_SYSTEMCTL_CALLS="${tmp_dir}/systemctl.calls"
+export TEST_SSH_CALLS="${tmp_dir}/ssh.calls"
+export TEST_SSHD_CALLS="${tmp_dir}/sshd.calls"
+export TEST_REMOTE_HOME="${tmp_dir}/remote-home"
+export SAFE_SSH_TESTING=1
+export SAFE_SSH_GETENT="${tmp_dir}/bin/getent"
+export SAFE_SSH_SSHD="${tmp_dir}/bin/sshd"
+export SAFE_SSH_SSH="${tmp_dir}/bin/ssh"
+export SAFE_SSH_SYSTEMCTL="${tmp_dir}/bin/systemctl"
+export SAFE_SSH_SSHD_CONFIG_DIR="${TEST_SSHD_DIR}"
+export SAFE_SSH_SSHD_CONFIG="${TEST_SSHD_CONFIG}"
+export PATH="${tmp_dir}/bin:${PATH}"
+export HOME="${home}"
+export XDG_CONFIG_HOME="${home}/.config"
+mkdir -p "${TEST_REMOTE_HOME}"
+printf 'Include %s/*.conf\n' "${TEST_SSHD_DIR}" >"${TEST_SSHD_CONFIG}"
+
+# Executable injection hooks exist only behind the non-root test boundary.
+if grep -Fq '${SAFE_SSH_PYTHON3' "${script}"; then
+  fail "SAFE_SSH_PYTHON3 executable override remains"
+fi
+assert_file_contains "${script}" '[[ "${SAFE_SSH_TESTING:-}" == 1 && "${EUID}" != 0 ]]'
+
+# Every invocation initializes a private log before command work.
+"${script}" client_status >/dev/null
+[[ "$(stat -c %a "${home}/.safe_ssh/logs")" == 700 ]] || fail "unsafe log directory mode"
+log="$(find "${home}/.safe_ssh/logs" -type f -print -quit)"
+[[ -n "${log}" && "$(stat -c %a "${log}")" == 600 ]] || fail "unsafe log file mode"
+[[ "$(stat -c %u "${log}")" == "$(id -u)" ]] || fail "wrong log owner"
+assert_file_contains "${log}" "subcommand=client_status"
+
+# Caller-supplied internal logging state is rejected rather than trusted.
+set +e
+SAFE_SSH_LOG_FD=1 SAFE_SSH_LOG_FILE="${tmp_dir}/forged.log" \
+  SAFE_SSH_LOG_TIMESTAMP=20000101T000000Z \
+  "${script}" client_status >/dev/null 2>&1
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "caller-supplied logging state was accepted"
+
+# Logging refuses a symlinked directory without changing its target.
+symlink_home="${tmp_dir}/symlink-home"
+symlink_target="${tmp_dir}/symlink-target"
+mkdir -p "${symlink_home}" "${symlink_target}"
+chmod 755 "${symlink_target}"
+ln -s "${symlink_target}" "${symlink_home}/.safe_ssh"
+set +e
+TEST_HOME="${symlink_home}" HOME="${symlink_home}" "${script}" client_status >/dev/null 2>&1
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "symlinked log directory was accepted"
+[[ "$(stat -c %a "${symlink_target}")" == 755 ]] ||
+  fail "symlink target mode was changed"
+
+# Server lifecycle preserves the baseline AuthorizedKeysFile values and touches
+# only the owned drop-in.
+mkdir -p "${TEST_SSHD_DIR}"
+printf 'leave me\n' >"${TEST_SSHD_DIR}/90-unrelated.conf"
+TEST_SSHD_VERSION_EXIT=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --force >/dev/null
+assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "PasswordAuthentication no"
+assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" \
+  "AuthorizedKeysFile .ssh/authorized_keys .ssh/custom_keys .safe_ssh/authorized_keys"
+assert_file_contains "${TEST_SSHD_DIR}/90-unrelated.conf" "leave me"
+set +e
+status_output="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=1000 "${script}" server_status)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "unprivileged server_status was accepted"
+assert_contains "${status_output}" "server_status requires root"
+status_output="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_status)"
+assert_contains "${status_output}" "server: enabled"
+set +e
+status_output="$(TEST_SSHD_MATCH_WEAK=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_status)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "matched weak authentication policy reported enabled"
+assert_contains "${status_output}" "server: disabled"
+assert_file_contains "${TEST_SSHD_CALLS}" "-T -C"
+set +e
+status_output="$(TEST_SYSTEMCTL_INACTIVE=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_status)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "inactive SSH service reported enabled"
+assert_contains "${status_output}" "service=inactive"
+
+# Validation failure rolls back the owned file while preserving unrelated data.
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
+set +e
+TEST_SSHD_MATCH_WEAK=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --force >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "server_on accepted a weak matched connection context"
+set +e
+TEST_SSHD_FAIL_VALIDATE=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --force >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "server_on validation failure did not roll back"
+assert_file_contains "${TEST_SSHD_DIR}/90-unrelated.conf" "leave me"
+set +e
+TEST_SYSTEMCTL_FAIL=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --force >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "server_on reload failure did not roll back"
+set +e
+TEST_SSHD_IGNORE_DROPIN=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --force >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "server_on accepted an ineffective drop-in"
+
+printf 'Match User special\n  PasswordAuthentication yes\n' \
+  >"${TEST_SSHD_DIR}/90-match.conf"
+set +e
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --force >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "server_on accepted a matched authentication override"
+rm -f "${TEST_SSHD_DIR}/90-match.conf"
+
+# Match blocks in nested, arbitrary, or symlinked includes are also rejected.
+mkdir -p "${tmp_dir}/external"
+printf 'Match User nested\n  PasswordAuthentication yes\n' \
+  >"${tmp_dir}/external/nested.conf"
+set +e
+TEST_SSHD_EXTRA_CONFIG="${tmp_dir}/external/nested.conf" \
+  SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --force >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "server_on accepted a Match block in an arbitrary nested include"
+ln -s "${tmp_dir}/external/nested.conf" "${TEST_SSHD_DIR}/90-linked.conf"
+set +e
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --force >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "server_on accepted a Match block through a symlinked include"
+rm -f "${TEST_SSHD_DIR}/90-linked.conf"
+
+# A malformed key is not sufficient to risk disabling password access.
+mkdir -p "${home}/.ssh"
+chmod 700 "${home}/.ssh"
+printf 'ssh-ed25519 garbage\n' >"${home}/.ssh/authorized_keys"
+chmod 600 "${home}/.ssh/authorized_keys"
+set +e
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "malformed administrator key was accepted"
+
+# An option-prefixed administrator key may be conditional or restricted, so it
+# is not sufficient evidence that the administrator can safely log in.
+printf 'from="192.0.2.1" ssh-ed25519 AAAA_EXISTING admin\n' >"${home}/.ssh/authorized_keys"
+set +e
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "conditional administrator key was accepted"
+
+printf 'ssh-ed25519 AAAA_EXISTING admin\n' >"${home}/.ssh/authorized_keys"
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+assert_file_contains "${TEST_SSH_CALLS}" "PreferredAuthentications=publickey"
+assert_file_contains "${TEST_SSH_CALLS}" "-F /dev/null"
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
+
+set +e
+TEST_SSH_LOGIN_PROBE_FAIL=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "failed administrator login probe changed the server policy"
+
+chmod 777 "${home}/.ssh"
+set +e
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "key beneath a writable SSH directory was accepted"
+chmod 755 "${home}/.ssh"
+
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on --force >/dev/null
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] || fail "server_off left owned drop-in"
+
+# Clients use independent keys/known_hosts and a single marked Include without
+# disturbing an unrelated SSH host.
+set +e
+"${script}" client_add Foo alice@example.test >/dev/null 2>&1
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${home}/.config/safe_ssh/clients/Foo" ]] ||
+  fail "uppercase client name was accepted"
+
+printf 'ServerAliveInterval 30\nHost existing\n  IdentityFile ~/.ssh/existing\n' >"${home}/.ssh/config"
+mkdir -p "${TEST_REMOTE_HOME}/.safe_ssh"
+chmod 777 "${TEST_REMOTE_HOME}/.safe_ssh"
+
+# A failed initial authorization can be discarded explicitly without requiring
+# access to the unreachable target, freeing the profile name for reuse.
+set +e
+TEST_REMOTE_HOME=/dev/null \
+  "${script}" client_add orphan alice@unreachable.test >/dev/null 2>&1
+status=$?
+set -e
+orphan="${home}/.config/safe_ssh/clients/orphan"
+[[ "${status}" -ne 0 && -d "${orphan}" ]] ||
+  fail "failed initial client authorization did not retain recovery state"
+calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
+"${script}" client_delete orphan --local-only >/dev/null
+[[ ! -e "${orphan}" ]] || fail "local-only deletion retained the unusable profile"
+[[ "$(wc -l <"${TEST_SSH_CALLS}")" == "${calls_before}" ]] ||
+  fail "local-only deletion attempted remote revocation"
+"${script}" client_add orphan alice@example.test >/dev/null
+"${script}" client_delete orphan >/dev/null
+
+"${script}" client_add alpha alice@example.test --port 2222 >/dev/null
+"${script}" client_add beta bob@example.net >/dev/null
+alpha="${home}/.config/safe_ssh/clients/alpha"
+beta="${home}/.config/safe_ssh/clients/beta"
+[[ -f "${alpha}/id_ed25519" && -f "${beta}/id_ed25519" ]] || fail "missing client identities"
+[[ "${alpha}/id_ed25519" != "${beta}/id_ed25519" ]] || fail "identities are not independent"
+calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
+set +e
+"${script}" client_delete alpha --local-only >/dev/null 2>&1
+status=$?
+set -e
+[[ "${status}" -ne 0 && -d "${alpha}" ]] ||
+  fail "local-only deletion discarded an authorized profile"
+[[ "$(wc -l <"${TEST_SSH_CALLS}")" == "${calls_before}" ]] ||
+  fail "rejected local-only deletion attempted remote revocation"
+assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/alpha.conf" "Host safe-ssh-alpha"
+assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/beta.conf" "Host safe-ssh-beta"
+assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/alpha.conf" \
+  "GlobalKnownHostsFile /dev/null"
+assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/alpha.conf" \
+  "PreferredAuthentications publickey"
+assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/alpha.conf" \
+  "PasswordAuthentication no"
+assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/alpha.conf" \
+  "KbdInteractiveAuthentication no"
+[[ "$(grep -Fc '# safe_ssh managed include' "${home}/.ssh/config")" == 1 ]] ||
+  fail "SSH config must contain exactly one managed include"
+[[ "$(head -1 "${home}/.ssh/config")" == '# safe_ssh managed include' ]] ||
+  fail "managed include is not at the top"
+assert_file_contains "${home}/.ssh/config" "Host * # safe_ssh managed scope reset"
+assert_file_contains "${home}/.ssh/config" "ServerAliveInterval 30"
+assert_file_contains "${home}/.ssh/config" "Host existing"
+assert_file_contains "${TEST_SSH_CALLS}" "IdentitiesOnly=yes"
+assert_file_contains "${TEST_SSH_CALLS}" "UserKnownHostsFile=${alpha}/known_hosts"
+dedicated_calls="$(grep 'id_ed25519 .* true $' "${TEST_SSH_CALLS}")"
+[[ -n "${dedicated_calls}" ]] || fail "missing dedicated-key verification call"
+while IFS= read -r call; do
+  assert_contains "${call}" "PreferredAuthentications=publickey"
+  assert_contains "${call}" "PasswordAuthentication=no"
+  assert_contains "${call}" "KbdInteractiveAuthentication=no"
+  assert_contains "${call}" "ChallengeResponseAuthentication=no"
+  assert_contains "${call}" "GSSAPIAuthentication=no"
+  assert_contains "${call}" "HostbasedAuthentication=no"
+  assert_contains "${call}" "NumberOfPasswordPrompts=0"
+done <<<"${dedicated_calls}"
+assert_file_contains "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys" \
+  "ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_alpha safe_ssh:alpha"
+[[ "$(stat -c %a "${TEST_REMOTE_HOME}/.safe_ssh")" == 700 ]] ||
+  fail "existing remote safe_ssh directory mode was not secured"
+
+# Bracketed IPv6 input is stored as entered but passed to OpenSSH without
+# brackets, both as a destination and as a generated HostName.
+calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
+"${script}" client_add ipv6 alice@[::1] >/dev/null
+ipv6_calls="$(tail -n "+$((calls_before + 1))" "${TEST_SSH_CALLS}")"
+assert_contains "${ipv6_calls}" "alice@::1"
+assert_contains "${ipv6_calls}" "HostName=::1"
+assert_contains "${ipv6_calls}" "ControlMaster=no"
+assert_contains "${ipv6_calls}" "ControlPath=none"
+[[ "${ipv6_calls}" != *'alice@\[::1\]'* ]] ||
+  fail "bracketed IPv6 destination was passed to ssh"
+assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/ipv6.conf" "HostName ::1"
+status_output="$("${script}" client_status ipv6)"
+assert_contains "${status_output}" "ipv6: ready"
+calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
+"${script}" client_delete ipv6 >/dev/null
+ipv6_delete_calls="$(tail -n "+$((calls_before + 1))" "${TEST_SSH_CALLS}")"
+assert_contains "${ipv6_delete_calls}" "alice@::1"
+assert_contains "${ipv6_delete_calls}" "HostName=::1"
+assert_contains "${ipv6_delete_calls}" "ControlMaster=no"
+assert_contains "${ipv6_delete_calls}" "ControlPath=none"
+[[ "${ipv6_delete_calls}" != *'alice@\[::1\]'* ]] ||
+  fail "bracketed IPv6 destination was passed to ssh during deletion"
+
+calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
+"${script}" client_add alpha alice@example.test --port 2222 >/dev/null
+retry_calls="$(tail -n "+$((calls_before + 1))" "${TEST_SSH_CALLS}")"
+[[ "$(wc -l <<<"${retry_calls}")" == 1 ]] ||
+  fail "existing profile retry did not use only dedicated verification"
+[[ "${retry_calls}" != *"bash -s --"* && "${retry_calls}" == *"BatchMode=yes"* ]] ||
+  fail "existing profile retry fell back to bootstrap authorization"
+assert_contains "${retry_calls}" "ControlMaster=no"
+assert_contains "${retry_calls}" "ControlPath=none"
+assert_contains "${retry_calls}" "HostName=example.test"
+
+set +e
+"${script}" client_add alpha alice@different.test >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "same name with different target was accepted"
+
+status_output="$("${script}" client_status)"
+assert_contains "${status_output}" "alpha: ready"
+assert_contains "${status_output}" "beta: ready"
+set +e
+status_output="$(TEST_SSH_LOCALE_PROBE=1 "${script}" client_status alpha)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "failed status probe reported ready"
+assert_contains "${status_output}" "alpha: unauthorized"
+
+# Status requires an owned snippet whose effective alias settings still match
+# the profile; a regular but replaced or corrupted snippet is not ready.
+alpha_snippet="${home}/.config/safe_ssh/ssh_config.d/alpha.conf"
+assert_file_contains "${alpha_snippet}" "ControlMaster no"
+assert_file_contains "${alpha_snippet}" "ControlPath none"
+cp "${alpha_snippet}" "${tmp_dir}/alpha.conf"
+sed '1d' "${tmp_dir}/alpha.conf" >"${alpha_snippet}"
+set +e
+status_output="$("${script}" client_status alpha)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "unowned snippet reported ready"
+assert_contains "${status_output}" "alpha: local-only"
+cp "${tmp_dir}/alpha.conf" "${alpha_snippet}"
+sed -i 's/HostName example.test/HostName corrupted.test/' "${alpha_snippet}"
+set +e
+status_output="$("${script}" client_status alpha)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "corrupted effective alias reported ready"
+assert_contains "${status_output}" "alpha: local-only"
+cp "${tmp_dir}/alpha.conf" "${alpha_snippet}"
+sed -i '/GlobalKnownHostsFile/d' "${alpha_snippet}"
+set +e
+status_output="$("${script}" client_status alpha)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "alias using global known hosts reported ready"
+assert_contains "${status_output}" "alpha: local-only"
+cp "${tmp_dir}/alpha.conf" "${alpha_snippet}"
+sed -i 's/StrictHostKeyChecking ask/StrictHostKeyChecking no/' "${alpha_snippet}"
+set +e
+status_output="$("${script}" client_status alpha)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "alias with disabled host-key checking reported ready"
+assert_contains "${status_output}" "alpha: local-only"
+cp "${tmp_dir}/alpha.conf" "${alpha_snippet}"
+sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' "${alpha_snippet}"
+set +e
+status_output="$("${script}" client_status alpha)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "alias allowing password authentication reported ready"
+assert_contains "${status_output}" "alpha: local-only"
+cp "${tmp_dir}/alpha.conf" "${alpha_snippet}"
+sed -i 's/ControlMaster no/ControlMaster auto/' "${alpha_snippet}"
+set +e
+status_output="$("${script}" client_status alpha)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "alias allowing multiplexing reported ready"
+assert_contains "${status_output}" "alpha: local-only"
+cp "${tmp_dir}/alpha.conf" "${alpha_snippet}"
+sed -i 's|ControlPath none|ControlPath ~/.ssh/control-%C|' "${alpha_snippet}"
+set +e
+status_output="$("${script}" client_status alpha)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "alias with a multiplexing control path reported ready"
+assert_contains "${status_output}" "alpha: local-only"
+cp "${tmp_dir}/alpha.conf" "${alpha_snippet}"
+
+# Remote revocation failure retains all local state. Successful deletion removes
+# only that profile, and deleting the last profile removes only our Include.
+sed -i '/safe_ssh:alpha/d' "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys"
+printf '%s\n%s\n' \
+  'from="192.0.2.1" ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_alpha changed-comment' \
+  'ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_alpha duplicate-comment' \
+  >>"${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys"
+set +e
+TEST_SSH_DELETE_FAIL=1 "${script}" client_delete alpha >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && -d "${alpha}" ]] || fail "failed revocation removed local state"
+cp "${beta}/id_ed25519.pub" "${alpha}/id_ed25519.pub"
+"${script}" client_delete alpha >/dev/null
+[[ ! -d "${alpha}" && -d "${beta}" ]] || fail "client deletion was not isolated"
+if grep -Fq "AAAA_SAFE_SSH_PUBLIC_KEY_alpha" "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys"; then
+  fail "remote revocation did not remove all forms of the public key"
+fi
+assert_file_contains "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys" "safe_ssh:beta"
+assert_file_contains "${home}/.ssh/config" "# safe_ssh managed include"
+quoted_option_key='command="echo ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_beta done" ssh-ed25519 AAAA_UNRELATED quoted-option'
+quoted_comment='# ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_beta is not a key'
+printf '%s\n%s\n' "${quoted_option_key}" "${quoted_comment}" \
+  >>"${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys"
+"${script}" client_delete beta >/dev/null
+assert_file_contains "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys" "${quoted_option_key}"
+assert_file_contains "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys" "${quoted_comment}"
+[[ "$(grep -Fc '# safe_ssh managed include' "${home}/.ssh/config")" == 0 ]] ||
+  fail "last deletion left managed include"
+assert_file_contains "${home}/.ssh/config" "Host existing"
+
+# A replaced, unowned Host snippet blocks deletion before remote state changes.
+"${script}" client_add guarded dave@example.dev >/dev/null
+printf 'Host unrelated\n' >"${home}/.config/safe_ssh/ssh_config.d/guarded.conf"
+calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
+set +e
+"${script}" client_delete guarded >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && -d "${home}/.config/safe_ssh/clients/guarded" ]] ||
+  fail "unowned SSH snippet was deleted"
+[[ "$(wc -l <"${TEST_SSH_CALLS}")" == "${calls_before}" ]] ||
+  fail "remote revocation ran before unowned snippet rejection"
+
+# Generated SSH configuration remains effective when its managed paths contain
+# spaces, and status compares the complete values reported by ssh -G.
+space_home="${tmp_dir}/home with space"
+mkdir -p "${space_home}"
+chmod 700 "${space_home}"
+TEST_HOME="${space_home}"
+HOME="${space_home}"
+XDG_CONFIG_HOME="${space_home}/config with space"
+export TEST_HOME HOME XDG_CONFIG_HOME
+"${script}" client_add spaced erin@example.space >/dev/null
+spaced_root="${XDG_CONFIG_HOME}/safe_ssh"
+assert_file_contains "${space_home}/.ssh/config" \
+  "Include \"${spaced_root}/ssh_config.d/*\""
+assert_file_contains "${spaced_root}/ssh_config.d/spaced.conf" \
+  "IdentityFile \"${spaced_root}/clients/spaced/id_ed25519\""
+status_output="$("${script}" client_status spaced)"
+assert_contains "${status_output}" "spaced: ready"
+"${script}" client_delete spaced >/dev/null
+TEST_HOME="${home}"
+HOME="${home}"
+XDG_CONFIG_HOME="${home}/.config"
+export TEST_HOME HOME XDG_CONFIG_HOME
+
+# Sudo logging resolves SUDO_USER through passwd, uses private modes, and logs
+# only the key fingerprint—not private/public key material or token values.
+set +e
+SUDO_USER=tester SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" client_add gamma carol@example.org >/dev/null 2>&1
+status=$?
+set -e
+[[ "${status}" -ne 0 &&
+   ! -e "${home}/.config/safe_ssh/clients/gamma" &&
+   ! -e "${home}/.config/safe_ssh/ssh_config.d/gamma.conf" ]] ||
+  fail "sudo client command created root-owned client artifacts"
+SUDO_USER=tester SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" client_add gamma carol@example.org --bootstrap-identity "${tmp_dir}/missing" >/dev/null 2>&1 || true
+set +e
+"${script}" unknown --token super-secret-token >/dev/null 2>&1
+set -e
+all_logs="$(cat "${home}/.safe_ssh/logs/"*.log)"
+assert_contains "${all_logs}" "[REDACTED]"
+assert_contains "${all_logs}" "user=tester subcommand=client_add"
+[[ "${all_logs}" != *"super-secret-token"* ]] || fail "token leaked to log"
+[[ "${all_logs}" != *"PRIVATE-KEY-MUST-NOT-BE-LOGGED"* ]] || fail "private key leaked to log"
+[[ "${all_logs}" != *"AAAA_SAFE_SSH_PUBLIC_KEY"* ]] || fail "public key leaked to log"
+
+printf 'safe_ssh tests passed\n'
