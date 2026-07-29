@@ -29,7 +29,6 @@ LOG_FD=""
 usage() {
   cat <<'EOF'
 Usage:
-  safe_ssh.sh server_prepare
   safe_ssh.sh server_on --admin-user USER
   safe_ssh.sh server_off
   safe_ssh.sh server_status
@@ -356,6 +355,31 @@ server_policy_all_contexts_effective() {
   fi
 }
 
+standard_authorized_keys_effective() {
+  local effective="$1" auth
+  auth="$(awk 'tolower($1)=="authorizedkeysfile"{$1="";sub(/^ /,"");print;exit}' <<<"${effective}")"
+  [[ " ${auth} " == *" .ssh/authorized_keys "* ||
+     " ${auth} " == *" %h/.ssh/authorized_keys "* ]]
+}
+
+standard_authorized_keys_all_contexts_effective() {
+  local user="${1:-${INITIATOR_USER}}" effective context matched_status
+  effective="$(sshd_effective)" || return 1
+  standard_authorized_keys_effective "${effective}" || return 1
+  for context in \
+    "user=${user},host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=22" \
+    "user=${user},host=example.invalid,addr=192.0.2.1,laddr=192.0.2.2,lport=22"; do
+    effective="$("${SSHD_BIN}" -T -C "${context}")" || return 1
+    standard_authorized_keys_effective "${effective}" || return 1
+  done
+  if matched_policy_directive >/dev/null; then
+    return 1
+  else
+    matched_status=$?
+    [[ "${matched_status}" == 1 ]]
+  fi
+}
+
 reload_sshd() {
   "${SYSTEMCTL_BIN}" reload ssh.service 2>/dev/null ||
     "${SYSTEMCTL_BIN}" reload sshd.service
@@ -407,7 +431,7 @@ admin_has_key() {
   local admin="$1" auth_values="$2" home uid token file
   home="$(user_home "${admin}")" || return 1
   uid="$(passwd_record "${admin}" | awk -F: '{print $3}')"
-  for token in ${auth_values} .safe_ssh/authorized_keys; do
+  for token in ${auth_values}; do
     [[ "${token}" != none ]] || continue
     token="${token//%%/%}"
     token="${token//%h/${home}}"
@@ -450,43 +474,15 @@ admin_login_probe() {
 }
 
 server_policy_effective() {
-  local effective="$1" pub pass kbd methods auth
+  local effective="$1" pub pass kbd methods
   pub="$(awk 'tolower($1)=="pubkeyauthentication"{print tolower($2);exit}' <<<"${effective}")"
   pass="$(awk 'tolower($1)=="passwordauthentication"{print tolower($2);exit}' <<<"${effective}")"
   kbd="$(awk 'tolower($1)=="kbdinteractiveauthentication"{print tolower($2);exit}' <<<"${effective}")"
   methods="$(awk 'tolower($1)=="authenticationmethods"{$1="";sub(/^ /,"");print tolower($0);exit}' <<<"${effective}")"
-  auth="$(awk 'tolower($1)=="authorizedkeysfile"{$1="";sub(/^ /,"");print;exit}' <<<"${effective}")"
   [[ "${pub}" == yes &&
      "${pass}" == no &&
      "${kbd}" == no &&
-     "${methods}" == publickey &&
-     " ${auth} " == *" .safe_ssh/authorized_keys "* ]]
-}
-
-server_prerequisites_effective() {
-  local effective="$1" pub auth
-  pub="$(awk 'tolower($1)=="pubkeyauthentication"{print tolower($2);exit}' <<<"${effective}")"
-  auth="$(awk 'tolower($1)=="authorizedkeysfile"{$1="";sub(/^ /,"");print;exit}' <<<"${effective}")"
-  [[ "${pub}" == yes && " ${auth} " == *" .safe_ssh/authorized_keys "* ]]
-}
-
-server_prerequisites_all_contexts_effective() {
-  local user="${1:-${INITIATOR_USER}}" effective context matched_status
-  effective="$(sshd_effective)" || return 1
-  server_prerequisites_effective "${effective}" || return 1
-  for context in \
-    "user=${user},host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=22" \
-    "user=${user},host=example.invalid,addr=192.0.2.1,laddr=192.0.2.2,lport=22" \
-    "user=root,host=localhost,addr=::1,laddr=::1,lport=22"; do
-    effective="$("${SSHD_BIN}" -T -C "${context}")" || return 1
-    server_prerequisites_effective "${effective}" || return 1
-  done
-  if matched_policy_directive >/dev/null; then
-    return 1
-  else
-    matched_status=$?
-    [[ "${matched_status}" == 1 ]]
-  fi
+     "${methods}" == publickey ]]
 }
 
 owned_server_state() {
@@ -511,81 +507,10 @@ sshd_service_active() {
     "${SYSTEMCTL_BIN}" is-active --quiet sshd.service 2>/dev/null
 }
 
-server_prepare() {
-  require_root server_prepare
-  ensure_server_scope
-  local baseline auth_values prior="" had_prior=0 owned_state=""
-  shift
-  (($# == 0)) || { printf 'Error: server_prepare takes no arguments\n' >&2; return 2; }
-  if [[ -e "${OWNED_SSHD_CONFIG}" ]]; then
-    owned_state="$(owned_server_state)" || {
-      printf 'Error: refusing to replace unowned file %s\n' "${OWNED_SSHD_CONFIG}" >&2
-      return 1
-    }
-    case "${owned_state}" in
-      enabled)
-        if sshd_service_active &&
-           server_policy_all_contexts_effective "${INITIATOR_USER}"; then
-          printf 'safe_ssh server policy is already enabled.\n'
-          return 0
-        fi
-        printf 'Error: owned enabled policy is not effective; inspect server_status before changing it\n' >&2
-        return 1
-        ;;
-      prepared)
-        if server_prerequisites_all_contexts_effective "${INITIATOR_USER}"; then
-          printf 'safe_ssh server is already prepared.\n'
-          return 0
-        fi
-        ;;
-      *)
-        printf 'Error: refusing to replace unrecognized owned file %s\n' "${OWNED_SSHD_CONFIG}" >&2
-        return 1
-        ;;
-    esac
-  fi
-  phase server_baseline
-  baseline="$(sshd_effective)" || { printf 'Error: cannot read effective sshd configuration\n' >&2; return 1; }
-  auth_values="$(awk 'tolower($1)=="authorizedkeysfile" {$1=""; sub(/^ /,""); print; exit}' <<<"${baseline}")"
-  [[ -n "${auth_values}" ]] || auth_values=".ssh/authorized_keys .ssh/authorized_keys2"
-  if [[ " ${auth_values} " != *" .safe_ssh/authorized_keys "* ]]; then
-    auth_values+=" .safe_ssh/authorized_keys"
-  fi
-  mkdir -p "${SSHD_CONFIG_DIR}"
-  if [[ -e "${OWNED_SSHD_CONFIG}" ]]; then
-    prior="$(mktemp "${SSHD_CONFIG_DIR}/.safe_ssh.rollback.XXXXXX")"
-    cp -p "${OWNED_SSHD_CONFIG}" "${prior}"
-    had_prior=1
-  fi
-  phase server_write
-  {
-    printf '%s\n%s\n' "${OWNED_HEADER}" "${PREPARED_MARKER}"
-    printf 'PubkeyAuthentication yes\n'
-    printf 'AuthorizedKeysFile %s\n' "${auth_values}"
-  } | write_atomic "${OWNED_SSHD_CONFIG}" 644
-  phase server_validate
-  if ! "${SSHD_BIN}" -t ||
-     ! server_prerequisites_all_contexts_effective "${INITIATOR_USER}"; then
-    printf 'Error: safe_ssh preparation is not effective in all checked SSH connection contexts\n' >&2
-    phase rollback
-    if ((had_prior)); then mv -f "${prior}" "${OWNED_SSHD_CONFIG}"; else rm -f "${OWNED_SSHD_CONFIG}"; fi
-    return 1
-  fi
-  phase server_reload
-  if ! reload_sshd; then
-    phase rollback
-    if ((had_prior)); then mv -f "${prior}" "${OWNED_SSHD_CONFIG}"; else rm -f "${OWNED_SSHD_CONFIG}"; fi
-    "${SSHD_BIN}" -t && reload_sshd || true
-    return 1
-  fi
-  [[ -z "${prior}" ]] || rm -f "${prior}"
-  printf 'safe_ssh server prepared for client key installation.\n'
-}
-
 server_on() {
   require_root server_on
   ensure_server_scope
-  local admin="" baseline auth_values prior="" owned_state legacy_enabled=0
+  local admin="" owned_state
   shift
   while (($#)); do
     case "$1" in
@@ -594,29 +519,33 @@ server_on() {
     esac
   done
   [[ -n "${admin}" ]] || { printf 'Error: --admin-user USER is required\n' >&2; return 2; }
-  owned_state="$(owned_server_state 2>/dev/null || true)"
-  if [[ "${owned_state}" == enabled ]]; then
-    if ! sshd_service_active ||
-       ! server_policy_all_contexts_effective "${admin}"; then
+  owned_state=""
+  if [[ -e "${OWNED_SSHD_CONFIG}" || -L "${OWNED_SSHD_CONFIG}" ]]; then
+    owned_state="$(owned_server_state 2>/dev/null)" || {
+      printf 'Error: refusing to replace unowned file %s\n' "${OWNED_SSHD_CONFIG}" >&2
+      return 1
+    }
+  fi
+  if [[ -n "${owned_state}" ]]; then
+    if [[ "${owned_state}" == enabled ]] &&
+       ! grep -Eiq '^[[:space:]]*AuthorizedKeysFile[[:space:]]+' "${OWNED_SSHD_CONFIG}"; then
+      if sshd_service_active && server_policy_all_contexts_effective "${admin}"; then
+        printf 'safe_ssh server policy is already enabled.\n'
+        return 0
+      fi
       printf 'Error: owned enabled policy is not effective; inspect server_status before changing it\n' >&2
       return 1
     fi
-    if grep -Fqx "${ENABLED_MARKER}" "${OWNED_SSHD_CONFIG}"; then
-      printf 'safe_ssh server policy is already enabled.\n'
-      return 0
-    fi
-    legacy_enabled=1
+    printf 'Error: legacy safe_ssh drop-in detected; run server_off before server_on\n' >&2
+    return 1
   fi
-  [[ "${owned_state}" == prepared || "${legacy_enabled}" == 1 ]] || {
-    printf 'Error: server_prepare must complete before server_on\n' >&2
+  phase server_baseline
+  standard_authorized_keys_all_contexts_effective "${admin}" || {
+    printf 'Error: standard .ssh/authorized_keys is not effective for %s; refusing possible lockout\n' "${admin}" >&2
     return 1
   }
-  phase server_baseline
-  baseline="$(sshd_effective)" || { printf 'Error: cannot read effective sshd configuration\n' >&2; return 1; }
-  auth_values="$(awk 'tolower($1)=="authorizedkeysfile" {$1=""; sub(/^ /,""); print; exit}' <<<"${baseline}")"
-  [[ -n "${auth_values}" ]] || auth_values=".ssh/authorized_keys .ssh/authorized_keys2"
-  admin_has_key "${admin}" "${auth_values}" || {
-    printf 'Error: %s has no usable key in the current or safe_ssh authorization files; refusing possible lockout\n' "${admin}" >&2
+  admin_has_key "${admin}" ".ssh/authorized_keys" || {
+    printf 'Error: %s has no usable unconditional key in .ssh/authorized_keys; refusing possible lockout\n' "${admin}" >&2
     return 1
   }
   phase server_login_probe
@@ -624,11 +553,6 @@ server_on() {
     printf 'Error: public-key login probe for %s failed; refusing possible lockout\n' "${admin}" >&2
     return 1
   }
-  if [[ " ${auth_values} " != *" .safe_ssh/authorized_keys "* ]]; then
-    auth_values+=" .safe_ssh/authorized_keys"
-  fi
-  prior="$(mktemp "${SSHD_CONFIG_DIR}/.safe_ssh.rollback.XXXXXX")"
-  cp -p "${OWNED_SSHD_CONFIG}" "${prior}"
   phase server_write
   {
     printf '%s\n%s\n' "${OWNED_HEADER}" "${ENABLED_MARKER}"
@@ -637,28 +561,26 @@ server_on() {
     printf 'KbdInteractiveAuthentication no\n'
     printf 'ChallengeResponseAuthentication no\n'
     printf 'AuthenticationMethods publickey\n'
-    printf 'AuthorizedKeysFile %s\n' "${auth_values}"
   } | write_atomic "${OWNED_SSHD_CONFIG}" 644
   phase server_validate
   if ! "${SSHD_BIN}" -t; then
     phase rollback
-    mv -f "${prior}" "${OWNED_SSHD_CONFIG}"
+    rm -f "${OWNED_SSHD_CONFIG}"
     return 1
   fi
   if ! server_policy_all_contexts_effective "${admin}"; then
     printf 'Error: safe_ssh policy is not effective in all checked SSH connection contexts; check Include ordering and Match blocks\n' >&2
     phase rollback
-    mv -f "${prior}" "${OWNED_SSHD_CONFIG}"
+    rm -f "${OWNED_SSHD_CONFIG}"
     return 1
   fi
   phase server_reload
   if ! reload_sshd; then
     phase rollback
-    mv -f "${prior}" "${OWNED_SSHD_CONFIG}"
+    rm -f "${OWNED_SSHD_CONFIG}"
     "${SSHD_BIN}" -t && reload_sshd || true
     return 1
   fi
-  [[ -z "${prior}" ]] || rm -f "${prior}"
   printf 'safe_ssh server policy enabled.\n'
 }
 
@@ -705,19 +627,20 @@ server_status() {
   owned_state="$(owned_server_state 2>/dev/null || true)"
   [[ -n "${owned_state}" ]] && owned=yes
   sshd_service_active && service=active
-  if [[ "${owned_state}" == enabled && "${service}" == active ]] &&
+  if [[ -n "${owned_state}" ]] &&
+       grep -Eiq '^[[:space:]]*AuthorizedKeysFile[[:space:]]+' "${OWNED_SSHD_CONFIG}"; then
+      state=legacy
+  elif [[ "${owned_state}" == prepared ]]; then
+      state=legacy
+  elif [[ "${owned_state}" == enabled && "${service}" == active ]] &&
        server_policy_effective "${effective}" &&
        server_policy_all_contexts_effective "${INITIATOR_USER}"; then
       state=enabled
-  elif [[ "${owned_state}" == prepared && "${service}" == active ]] &&
-       server_prerequisites_effective "${effective}" &&
-       server_prerequisites_all_contexts_effective "${INITIATOR_USER}"; then
-      state=prepared
   fi
   printf 'server: %s (service=%s, owned_dropin=%s, pubkey=%s, password=%s, keyboard_interactive=%s, authentication_methods=%s, authorized_keys=%s)\n' \
     "${state}" "${service}" "${owned}" "${pub:-unknown}" "${pass:-unknown}" "${kbd:-unknown}" \
     "${methods:-unknown}" "${auth:-unknown}"
-  [[ "${state}" == enabled || "${state}" == prepared ]]
+  [[ "${state}" == enabled ]]
 }
 
 client_root() {
@@ -803,23 +726,131 @@ remote_add_script() {
 set -eu
 key=$1
 umask 077
-dir="$HOME/.safe_ssh"
-[ ! -L "$dir" ]
-mkdir -p "$dir"
-[ -d "$dir" ] && [ -O "$dir" ]
-chmod 700 "$dir"
-file="$dir/authorized_keys"
+safe_dir() {
+  [ ! -L "$1" ] && [ -d "$1" ] && [ -O "$1" ]
+  chmod 700 "$1"
+  mode=$(stat -c %a -- "$1")
+  [ $((8#$mode & 8#022)) -eq 0 ]
+}
+reserve_backup() {
+  suffix=$1
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$
+  attempt=0
+  while [ "$attempt" -lt 100 ]; do
+    reserved="$backup_dir/authorized_keys-$stamp-$attempt.$suffix"
+    if (umask 077; set -C; : >"$reserved") 2>/dev/null; then
+      printf '%s\n' "$reserved"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+ssh_dir="$HOME/.ssh"
+[ ! -L "$ssh_dir" ]
+mkdir -p "$ssh_dir"
+safe_dir "$ssh_dir"
+file="$ssh_dir/authorized_keys"
+lock="$ssh_dir/.authorized_keys.safe_ssh.lock"
+[ ! -L "$lock" ]
+: >>"$lock"
+[ -f "$lock" ] && [ -O "$lock" ]
+chmod 600 "$lock"
+exec 9<>"$lock"
+flock -x 9
 [ ! -L "$file" ]
-touch "$file"
-chmod 600 "$file"
-if ! grep -Fqx -- "$key" "$file"; then
-  tmp="$file.safe_ssh.$$"
-  trap 'rm -f "$tmp"' EXIT HUP INT TERM
-  { cat "$file"; printf '%s\n' "$key"; } >"$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$file"
-  trap - EXIT HUP INT TERM
+[ ! -e "$file" ] || { [ -f "$file" ] && [ -O "$file" ]; }
+if [ -e "$file" ]; then
+  mode=$(stat -c %a -- "$file")
+  [ $((8#$mode & 8#022)) -eq 0 ]
 fi
+source=$(mktemp "$ssh_dir/.authorized_keys.safe_ssh.source.XXXXXX")
+tmp=
+trap '[ -z "$source" ] || rm -f "$source"; [ -z "$tmp" ] || rm -f "$tmp"' EXIT HUP INT TERM
+had_file=0
+if [ -e "$file" ]; then
+  cat "$file" >"$source"
+  had_file=1
+fi
+if [ "$had_file" -eq 1 ] && grep -Fqx -- "$key" "$source"; then
+  exit 0
+fi
+key_type=$(printf '%s\n' "$key" | awk '{print $1}')
+key_blob=$(printf '%s\n' "$key" | awk '{print $2}')
+if [ "$had_file" -eq 1 ] && awk -v type="$key_type" -v blob="$key_blob" '
+  function matching_key(line, fields, count, i, char, token, quoted, escaped) {
+    if (line ~ /^[[:space:]]*#/) return 0
+    fields[1]=fields[2]=fields[3]=""
+    count=0
+    token=""
+    quoted=0
+    escaped=0
+    for (i=1; i<=length(line); i++) {
+      char=substr(line, i, 1)
+      if (escaped) {
+        token=token char
+        escaped=0
+      } else if (char=="\\") {
+        token=token char
+        escaped=1
+      } else if (char=="\"") {
+        token=token char
+        quoted=!quoted
+      } else if (!quoted && char ~ /[[:space:]]/) {
+        if (token!="") {
+          fields[++count]=token
+          token=""
+          if (count==3) break
+        }
+      } else {
+        token=token char
+      }
+    }
+    if (token!="" && count<3) fields[++count]=token
+    return (fields[1]==type && fields[2]==blob) ||
+           (fields[2]==type && fields[3]==blob)
+  }
+  matching_key($0) {found=1}
+  END {exit found ? 0 : 1}
+' "$source"; then
+  printf 'Error: public key is already authorized with different options or comment\n' >&2
+  exit 1
+fi
+backup_dir="$HOME/.safe_ssh/backup"
+[ ! -L "$HOME/.safe_ssh" ]
+mkdir -p "$backup_dir"
+safe_dir "$HOME/.safe_ssh"
+safe_dir "$backup_dir"
+if [ "$had_file" -eq 1 ]; then
+  backup=$(reserve_backup bak) || exit 1
+  cat "$source" >"$backup" && chmod 600 "$backup" || { rm -f "$backup"; exit 1; }
+else
+  marker=$(reserve_backup absent) || exit 1
+  chmod 600 "$marker" || { rm -f "$marker"; exit 1; }
+fi
+tmp=$(mktemp "$ssh_dir/.authorized_keys.safe_ssh.XXXXXX")
+if [ "$had_file" -eq 1 ]; then
+  {
+    cat "$source"
+    if [ -s "$source" ] && ! tail -c 1 -- "$source" | grep -q '^$'; then
+      printf '\n'
+    fi
+    printf '%s\n' "$key"
+  } >"$tmp"
+else
+  printf '%s\n' "$key" >"$tmp"
+fi
+chmod 600 "$tmp"
+if [ "$had_file" -eq 1 ]; then
+  [ ! -L "$file" ] && [ -f "$file" ] && [ -O "$file" ] && cmp -s "$source" "$file"
+else
+  [ ! -e "$file" ]
+fi
+mv "$tmp" "$file"
+tmp=
+rm -f "$source"
+source=
+trap - EXIT HUP INT TERM
 REMOTE
 }
 
@@ -829,11 +860,29 @@ set -eu
 key=$1
 key_type=$(printf '%s\n' "$key" | awk '{print $1}')
 key_blob=$(printf '%s\n' "$key" | awk '{print $2}')
-file="$HOME/.safe_ssh/authorized_keys"
-[ ! -L "$HOME/.safe_ssh" ]
+ssh_dir="$HOME/.ssh"
+[ -e "$ssh_dir" ] || exit 0
+[ ! -L "$ssh_dir" ] && [ -d "$ssh_dir" ] && [ -O "$ssh_dir" ]
+chmod 700 "$ssh_dir"
+mode=$(stat -c %a -- "$ssh_dir")
+[ $((8#$mode & 8#022)) -eq 0 ]
+file="$ssh_dir/authorized_keys"
+lock="$ssh_dir/.authorized_keys.safe_ssh.lock"
+[ ! -L "$lock" ]
+: >>"$lock"
+[ -f "$lock" ] && [ -O "$lock" ]
+chmod 600 "$lock"
+exec 9<>"$lock"
+flock -x 9
 [ ! -L "$file" ]
 [ -f "$file" ] || exit 0
-tmp="$file.safe_ssh.$$"
+[ -O "$file" ]
+mode=$(stat -c %a -- "$file")
+[ $((8#$mode & 8#022)) -eq 0 ]
+source=$(mktemp "$ssh_dir/.authorized_keys.safe_ssh.source.XXXXXX")
+tmp=$(mktemp "$ssh_dir/.authorized_keys.safe_ssh.XXXXXX")
+trap '[ -z "$source" ] || rm -f "$source"; [ -z "$tmp" ] || rm -f "$tmp"' EXIT HUP INT TERM
+cat "$file" >"$source"
 awk -v type="$key_type" -v blob="$key_blob" '
   function matching_key(line, fields, count, i, char, token, quoted, escaped) {
     if (line ~ /^[[:space:]]*#/) return 0
@@ -870,9 +919,34 @@ awk -v type="$key_type" -v blob="$key_blob" '
   {
     if (!matching_key($0)) print
   }
-' "$file" >"$tmp"
+' "$source" >"$tmp"
+if cmp -s "$source" "$tmp"; then
+  exit 0
+fi
+backup_dir="$HOME/.safe_ssh/backup"
+[ ! -L "$HOME/.safe_ssh" ]
+mkdir -p "$backup_dir"
+[ ! -L "$backup_dir" ] && [ -d "$backup_dir" ] && [ -O "$HOME/.safe_ssh" ] && [ -O "$backup_dir" ]
+chmod 700 "$HOME/.safe_ssh" "$backup_dir"
+stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+  backup="$backup_dir/authorized_keys-$stamp-$attempt.bak"
+  if (umask 077; set -C; : >"$backup") 2>/dev/null; then
+    break
+  fi
+  backup=
+  attempt=$((attempt + 1))
+done
+[ -n "$backup" ] || exit 1
+cat "$source" >"$backup" && chmod 600 "$backup" || { rm -f "$backup"; exit 1; }
 chmod 600 "$tmp"
+[ ! -L "$file" ] && [ -f "$file" ] && [ -O "$file" ] && cmp -s "$source" "$file"
 mv "$tmp" "$file"
+tmp=
+rm -f "$source"
+source=
+trap - EXIT HUP INT TERM
 ! awk -v type="$key_type" -v blob="$key_blob" '
   function matching_key(line, fields, count, i, char, token, quoted, escaped) {
     if (line ~ /^[[:space:]]*#/) return 0
@@ -1217,7 +1291,6 @@ main() {
   init_log "$@"
   local command="${1:-}"
   case "${command}" in
-    server_prepare) server_prepare "$@" ;;
     server_on) server_on "$@" ;;
     server_off) server_off "$@" ;;
     server_status) server_status "$@" ;;

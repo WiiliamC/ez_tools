@@ -6,27 +6,26 @@ A collection of utility tools for Linux systems.
 
 Creates isolated, public-key-only SSH access profiles. Server management is
 limited to Ubuntu/Debian systems using systemd and OpenSSH. It never edits
-`~/.ssh/authorized_keys`: server-side keys are kept in
-`~/.safe_ssh/authorized_keys`.
+unrelated SSH configuration. Client keys are managed directly in the remote
+`~/.ssh/authorized_keys`, preserving unrelated keys, options, and comments.
+Before each actual add or removal it permanently saves the prior file under
+remote `~/.safe_ssh/backup/` (or creates a private `.absent` marker when the
+file did not exist). Repeating an already-applied operation creates no backup.
 
 ```bash
-# 1. On the server, allow safe_ssh client keys without disabling existing
-# password or keyboard-interactive authentication.
-sudo ./safe_ssh.sh server_prepare
-
-# 2. On the client, as the login user (never through sudo), install a dedicated
+# 1. On the client, as the login user (never through sudo), install a dedicated
 # key using existing SSH access.
 ./safe_ssh.sh client_add home alice@ssh.example.com --port 2222
 ./safe_ssh.sh client_add home alice@ssh.example.com \
   --port 2222 --bootstrap-identity ~/.ssh/existing_key
 
-# 3. Prove that the dedicated key can connect without fallback authentication.
+# 2. Prove that the dedicated key can connect without fallback authentication.
 ./safe_ssh.sh client_test home
 
-# 4. Back on the server, require public-key authentication. The administrator
-# must have a safe, usable key in an effective AuthorizedKeysFile, and its
-# private key or forwarded agent must be available to the sudo invocation for
-# a public-key login probe.
+# 3. Optionally, back on the server, require public-key authentication. The
+# administrator must have a safe, usable key in the effective standard
+# ~/.ssh/authorized_keys, and its private key or forwarded agent must be
+# available to the sudo invocation for a public-key login probe.
 sudo ./safe_ssh.sh server_on --admin-user alice
 
 sudo ./safe_ssh.sh server_status
@@ -56,6 +55,13 @@ public key remotely before deleting local files, so local recovery state is
 retained if revocation fails. If initial authorization never succeeded and the
 target cannot be reached, `client_delete NAME --local-only` explicitly removes
 only the local profile without attempting remote revocation.
+
+Upgrade note: there is no automatic migration from older `server_prepare`
+installations. Re-run each client profile with `client_add`, verify it with
+`client_test`, run `sudo ./safe_ssh.sh server_off` to remove the legacy managed
+drop-in, then optionally run the new `server_on`. `server_status` reports old
+prepared/enabled managed drop-ins as `legacy`; `server_on` will not overwrite
+them.
 
 The aliases work with standard tools:
 

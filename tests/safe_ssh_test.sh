@@ -60,7 +60,11 @@ if [[ "$1" == -T ]]; then
   else
     printf 'passwordauthentication yes\nkbdinteractiveauthentication yes\n'
     printf 'authenticationmethods any\n'
-    printf 'authorizedkeysfile .ssh/authorized_keys .ssh/custom_keys\n'
+    if [[ "${TEST_SSHD_NONSTANDARD_AUTH:-0}" == 1 ]]; then
+      printf 'authorizedkeysfile .ssh/custom_keys\n'
+    else
+      printf 'authorizedkeysfile .ssh/authorized_keys .ssh/custom_keys\n'
+    fi
   fi
 elif [[ "$1" == -t ]]; then
   [[ "${TEST_SSHD_FAIL_VALIDATE:-0}" != 1 ]]
@@ -222,96 +226,25 @@ set -e
 [[ "$(stat -c %a "${symlink_target}")" == 755 ]] ||
   fail "symlink target mode was changed"
 
-# Server preparation preserves AuthorizedKeysFile values, enables only the
-# prerequisites for client key installation, and touches only the owned file.
+# Server hardening is optional and never rewrites AuthorizedKeysFile.  Old
+# managed drop-ins are reported as legacy and must be removed explicitly.
 mkdir -p "${TEST_SSHD_DIR}"
 printf 'leave me\n' >"${TEST_SSHD_DIR}/90-unrelated.conf"
-TEST_SSHD_VERSION_EXIT=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_prepare >/dev/null
-assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: prepared"
-assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "PubkeyAuthentication yes"
-assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" \
-  "AuthorizedKeysFile .ssh/authorized_keys .ssh/custom_keys .safe_ssh/authorized_keys"
-if grep -Eq '^(PasswordAuthentication|KbdInteractiveAuthentication|AuthenticationMethods) ' \
-    "${TEST_SSHD_DIR}/00-safe-ssh.conf"; then
-  fail "server_prepare hardened authentication"
-fi
-assert_file_contains "${TEST_SSHD_DIR}/90-unrelated.conf" "leave me"
+set +e
+"${script}" server_prepare >/dev/null 2>&1
+status=$?
+set -e
+[[ "${status}" == 2 ]] || fail "removed server_prepare remained available"
 set +e
 status_output="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=1000 "${script}" server_status)"
 status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "unprivileged server_status was accepted"
 assert_contains "${status_output}" "server_status requires root"
+set +e
 status_output="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_status)"
-assert_contains "${status_output}" "server: prepared"
-
-# Preparation is idempotent, and enabling is unavailable without preparation.
-prepared_checksum="$(sha256sum "${TEST_SSHD_DIR}/00-safe-ssh.conf")"
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_prepare >/dev/null
-[[ "$(sha256sum "${TEST_SSHD_DIR}/00-safe-ssh.conf")" == "${prepared_checksum}" ]] ||
-  fail "server_prepare was not idempotent"
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
-set +e
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
-status=$?
 set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "server_on did not require preparation"
-set +e
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on --force >/dev/null
-status=$?
-set -e
-[[ "${status}" == 2 ]] || fail "server_on --force was not rejected as usage"
-
-# Preparation validates and reloads atomically.
-set +e
-TEST_SSHD_FAIL_VALIDATE=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_prepare >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "server_prepare validation failure did not roll back"
-set +e
-TEST_SYSTEMCTL_FAIL=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_prepare >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "server_prepare reload failure did not roll back"
-
-# Preparation rejects user-specific Match blocks that could override key
-# authentication for an intended client account.
-match_config="${tmp_dir}/match-client.conf"
-printf '%s\n' \
-  'Match User client-user' \
-  '    PubkeyAuthentication no' \
-  '    AuthorizedKeysFile none' >"${match_config}"
-set +e
-TEST_SSHD_EXTRA_CONFIG="${match_config}" SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_prepare >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "server_prepare accepted a user-specific Match block"
-
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_prepare >/dev/null
-
-set +e
-status_output="$(TEST_SSHD_MATCH_WEAK=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_status)"
-status=$?
-set -e
-[[ "${status}" -eq 0 ]] || fail "prepared state rejected permissive authentication"
-assert_contains "${status_output}" "server: prepared"
-set +e
-status_output="$(TEST_SYSTEMCTL_INACTIVE=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_status)"
-status=$?
-set -e
-[[ "${status}" -ne 0 ]] || fail "inactive SSH service reported enabled"
-assert_contains "${status_output}" "service=inactive"
+assert_contains "${status_output}" "server: disabled"
 
 # A malformed key is not sufficient to risk disabling password access.
 mkdir -p "${home}/.ssh"
@@ -336,6 +269,39 @@ set -e
 [[ "${status}" -ne 0 ]] || fail "conditional administrator key was accepted"
 
 printf 'ssh-ed25519 AAAA_EXISTING admin\n' >"${home}/.ssh/authorized_keys"
+set +e
+TEST_SSHD_NONSTANDARD_AUTH=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "server_on accepted an ineffective standard authorized_keys"
+match_config="${tmp_dir}/match-user.conf"
+printf '%s\n' \
+  'Match User bob' \
+  '    PasswordAuthentication yes' \
+  '    AuthorizedKeysFile .ssh/custom_keys' >"${match_config}"
+set +e
+TEST_SSHD_EXTRA_CONFIG="${match_config}" SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "server_on accepted an unverified conditional SSH context"
+
+# An existing unowned drop-in must never be overwritten.
+printf 'PasswordAuthentication yes\n' >"${TEST_SSHD_DIR}/00-safe-ssh.conf"
+unowned_checksum="$(sha256sum "${TEST_SSHD_DIR}/00-safe-ssh.conf")"
+set +e
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on --admin-user tester >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on accepted an unowned drop-in"
+[[ "$(sha256sum "${TEST_SSHD_DIR}/00-safe-ssh.conf")" == "${unowned_checksum}" ]] ||
+  fail "server_on overwrote an unowned drop-in"
+rm "${TEST_SSHD_DIR}/00-safe-ssh.conf"
+
 ssh_calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
   "${script}" server_on --admin-user tester >/dev/null
@@ -349,26 +315,40 @@ assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: enab
 assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "PasswordAuthentication no"
 status_output="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_status)"
 assert_contains "${status_output}" "server: enabled"
-
-# Re-enabling is idempotent. A failed first enable restores prepared state.
+set +e
+status_output="$(TEST_SYSTEMCTL_INACTIVE=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_status)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "inactive SSH service reported enabled"
+assert_contains "${status_output}" "server: disabled"
+enabled_checksum="$(sha256sum "${TEST_SSHD_DIR}/00-safe-ssh.conf")"
+ssh_calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
   "${script}" server_on --admin-user tester >/dev/null
+[[ "$(sha256sum "${TEST_SSHD_DIR}/00-safe-ssh.conf")" == "${enabled_checksum}" ]] ||
+  fail "idempotent server_on rewrote its drop-in"
+[[ "$(wc -l <"${TEST_SSH_CALLS}")" == "${ssh_calls_before}" ]] ||
+  fail "idempotent server_on repeated the login probe"
+grep -Fq -- '-ddd' "${TEST_SSHD_CALLS}" ||
+  fail "server policy validation did not inspect conditional SSH contexts"
+
+# A failed first enable removes its new drop-in.
 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_prepare >/dev/null
 set +e
 TEST_SSH_LOGIN_PROBE_FAIL=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
   "${script}" server_on --admin-user tester >/dev/null
 status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "server_on accepted a failed administrator login probe"
-assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: prepared"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] || fail "failed server_on left a drop-in"
 set +e
 TEST_SSHD_MATCH_WEAK=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
   "${script}" server_on --admin-user tester >/dev/null
 status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "server_on accepted a weak matched context"
-assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: prepared"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] || fail "weak context left a drop-in"
 
 chmod 777 "${home}/.ssh"
 set +e
@@ -379,30 +359,21 @@ set -e
 [[ "${status}" -ne 0 ]] || fail "key beneath a writable SSH directory was accepted"
 chmod 755 "${home}/.ssh"
 
-# Enabling validation and reload failures both restore prepared state.
+# Enabling validation and reload failures leave no new drop-in.
 set +e
 TEST_SSHD_FAIL_VALIDATE=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
   "${script}" server_on --admin-user tester >/dev/null
 status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "server_on accepted invalid sshd configuration"
-assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: prepared"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] || fail "validation failure left a drop-in"
 set +e
 TEST_SYSTEMCTL_FAIL=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
   "${script}" server_on --admin-user tester >/dev/null
 status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "server_on ignored reload failure"
-assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: prepared"
-
-# Preparing an enabled server never weakens it.
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_prepare >/dev/null
-assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: enabled"
-assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "PasswordAuthentication no"
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
-[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] || fail "server_off left owned drop-in"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] || fail "reload failure left a drop-in"
 
 # A pre-marker owned full-policy drop-in remains recognized as enabled.
 {
@@ -414,11 +385,15 @@ SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
     'AuthenticationMethods publickey' \
     'AuthorizedKeysFile .ssh/authorized_keys .safe_ssh/authorized_keys'
 } >"${TEST_SSHD_DIR}/00-safe-ssh.conf"
+set +e
 status_output="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_status)"
-assert_contains "${status_output}" "server: enabled"
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
-assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: enabled"
+set -e
+assert_contains "${status_output}" "server: legacy"
+set +e
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on --admin-user tester >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on overwrote a legacy drop-in"
 set +e
 TEST_SSHD_IGNORE_DROPIN=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
   "${script}" server_on --admin-user tester >/dev/null
@@ -437,8 +412,8 @@ set -e
   fail "uppercase client name was accepted"
 
 printf 'ServerAliveInterval 30\nHost existing\n  IdentityFile ~/.ssh/existing\n' >"${home}/.ssh/config"
-mkdir -p "${TEST_REMOTE_HOME}/.safe_ssh"
-chmod 777 "${TEST_REMOTE_HOME}/.safe_ssh"
+mkdir -p "${TEST_REMOTE_HOME}/.ssh"
+chmod 777 "${TEST_REMOTE_HOME}/.ssh"
 
 # A failed initial authorization can be discarded explicitly without requiring
 # access to the unreachable target, freeing the profile name for reuse.
@@ -458,8 +433,57 @@ calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
 "${script}" client_add orphan alice@example.test >/dev/null
 "${script}" client_delete orphan >/dev/null
 
+backup_dir="${TEST_REMOTE_HOME}/.safe_ssh/backup"
+# Reusing a key with different comments or options must not add a broader,
+# unrestricted authorization for the same key identity.
+conflicting_key='from="192.0.2.1" ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_conflict changed-comment'
+printf '%s\n' "${conflicting_key}" >"${TEST_REMOTE_HOME}/.ssh/authorized_keys"
+cp "${TEST_REMOTE_HOME}/.ssh/authorized_keys" "${tmp_dir}/authorized_keys.before-conflict"
+set +e
+"${script}" client_add conflict alice@example.test >/dev/null 2>&1
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "conflicting authorization was accepted"
+cmp -s "${tmp_dir}/authorized_keys.before-conflict" \
+  "${TEST_REMOTE_HOME}/.ssh/authorized_keys" ||
+  fail "conflicting authorization changed authorized_keys"
+[[ "$(grep -Fc 'AAAA_SAFE_SSH_PUBLIC_KEY_conflict' \
+    "${TEST_REMOTE_HOME}/.ssh/authorized_keys")" == 1 ]] ||
+  fail "conflicting authorization duplicated the key identity"
+"${script}" client_delete conflict --local-only >/dev/null
+
+existing_key='ssh-ed25519 AAAA_PREEXISTING existing'
+printf '%s' "${existing_key}" >"${TEST_REMOTE_HOME}/.ssh/authorized_keys"
 "${script}" client_add alpha alice@example.test --port 2222 >/dev/null
+grep -Fqx -- "${existing_key}" "${TEST_REMOTE_HOME}/.ssh/authorized_keys" ||
+  fail "authorization corrupted an unterminated existing key"
+grep -Fqx -- 'ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_alpha safe_ssh:alpha' \
+  "${TEST_REMOTE_HOME}/.ssh/authorized_keys" ||
+  fail "authorization concatenated a new key onto an unterminated line"
+cp "${TEST_REMOTE_HOME}/.ssh/authorized_keys" "${tmp_dir}/authorized_keys.before-beta"
+backups_before_beta="$(find "${backup_dir}" -name '*.bak' | wc -l)"
 "${script}" client_add beta bob@example.net >/dev/null
+[[ "$(find "${backup_dir}" -name '*.bak' | wc -l)" == "$((backups_before_beta + 1))" ]] ||
+  fail "content-changing authorization did not back up authorized_keys"
+beta_backup="$(find "${backup_dir}" -name '*.bak' \
+  -exec cmp -s "${tmp_dir}/authorized_keys.before-beta" {} \; -print -quit)"
+[[ -n "${beta_backup}" ]] ||
+  fail "authorization backup did not preserve the prior file"
+cp "${TEST_REMOTE_HOME}/.ssh/authorized_keys" "${tmp_dir}/authorized_keys.before-backup-failure"
+mv "${backup_dir}" "${TEST_REMOTE_HOME}/.safe_ssh/backup.saved"
+mkdir "${tmp_dir}/unsafe-backup-target"
+ln -s "${tmp_dir}/unsafe-backup-target" "${backup_dir}"
+set +e
+"${script}" client_add backupfail carol@example.org >/dev/null
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "authorization continued after backup rejection"
+cmp -s "${tmp_dir}/authorized_keys.before-backup-failure" \
+  "${TEST_REMOTE_HOME}/.ssh/authorized_keys" ||
+  fail "backup failure changed authorized_keys"
+rm "${backup_dir}"
+mv "${TEST_REMOTE_HOME}/.safe_ssh/backup.saved" "${backup_dir}"
+"${script}" client_delete backupfail --local-only >/dev/null
 alpha="${home}/.config/safe_ssh/clients/alpha"
 beta="${home}/.config/safe_ssh/clients/beta"
 [[ -f "${alpha}/id_ed25519" && -f "${beta}/id_ed25519" ]] || fail "missing client identities"
@@ -498,10 +522,19 @@ alpha_authorize_call="$(grep "${alpha}/id_ed25519" "${TEST_SSH_CALLS}" | grep 'b
 assert_contains "${alpha_authorize_call}" "-i ${alpha}/id_ed25519"
 [[ "${alpha_authorize_call}" != *"IdentitiesOnly=yes"* ]] ||
   fail "default authorization prevented fallback identities"
-assert_file_contains "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys" \
+assert_file_contains "${TEST_REMOTE_HOME}/.ssh/authorized_keys" \
   "ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_alpha safe_ssh:alpha"
-[[ "$(stat -c %a "${TEST_REMOTE_HOME}/.safe_ssh")" == 700 ]] ||
-  fail "existing remote safe_ssh directory mode was not secured"
+[[ "$(stat -c %a "${TEST_REMOTE_HOME}/.ssh")" == 700 ]] ||
+  fail "existing remote SSH directory mode was not secured"
+[[ "$(stat -c %a "${TEST_REMOTE_HOME}/.ssh/authorized_keys")" == 600 &&
+    "$(stat -c %a "${backup_dir}")" == 700 ]] ||
+  fail "remote authorization paths have unsafe modes"
+[[ "$(find "${backup_dir}" -name '*.absent' | wc -l)" == 1 ]] ||
+  fail "first authorization did not preserve an absent marker"
+while IFS= read -r backup; do
+  [[ "$(stat -c %a "${backup}")" == 600 ]] ||
+    fail "authorization backup has an unsafe mode"
+done < <(find "${backup_dir}" -type f)
 
 # Bracketed IPv6 input is stored as entered but passed to OpenSSH without
 # brackets, both as a destination and as a generated HostName.
@@ -528,6 +561,7 @@ assert_contains "${ipv6_delete_calls}" "ControlPath=none"
   fail "bracketed IPv6 destination was passed to ssh during deletion"
 
 calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
+backups_before_retry="$(find "${backup_dir}" -type f | wc -l)"
 "${script}" client_add alpha alice@example.test --port 2222 >/dev/null
 retry_calls="$(tail -n "+$((calls_before + 1))" "${TEST_SSH_CALLS}")"
 [[ "$(wc -l <<<"${retry_calls}")" == 1 ]] ||
@@ -537,8 +571,30 @@ retry_calls="$(tail -n "+$((calls_before + 1))" "${TEST_SSH_CALLS}")"
 assert_contains "${retry_calls}" "ControlMaster=no"
 assert_contains "${retry_calls}" "ControlPath=none"
 assert_contains "${retry_calls}" "HostName=example.test"
-[[ "$(grep -Fc 'safe_ssh:alpha' "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys")" == 1 ]] ||
+[[ "$(grep -Fc 'safe_ssh:alpha' "${TEST_REMOTE_HOME}/.ssh/authorized_keys")" == 1 ]] ||
   fail "existing profile retry duplicated the remote key"
+[[ "$(find "${backup_dir}" -type f | wc -l)" == "${backups_before_retry}" ]] ||
+  fail "idempotent authorization created a backup"
+
+# Revoking a key that is present only in a comment is also idempotent.
+"${script}" client_add noop alice@example.test >/dev/null
+sed -i '/safe_ssh:noop/d' "${TEST_REMOTE_HOME}/.ssh/authorized_keys"
+noop_comment='# ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_noop is documentation'
+printf '%s\n' "${noop_comment}" >>"${TEST_REMOTE_HOME}/.ssh/authorized_keys"
+backups_before_noop_delete="$(find "${backup_dir}" -type f | wc -l)"
+"${script}" client_delete noop >/dev/null
+[[ "$(find "${backup_dir}" -type f | wc -l)" == "${backups_before_noop_delete}" ]] ||
+  fail "idempotent revocation created a backup"
+assert_file_contains "${TEST_REMOTE_HOME}/.ssh/authorized_keys" "${noop_comment}"
+
+# A missing remote SSH directory proves the key is already revoked, so deletion
+# can still remove the local profile.
+"${script}" client_add missingdir alice@example.test >/dev/null
+mv "${TEST_REMOTE_HOME}/.ssh" "${TEST_REMOTE_HOME}/ssh.saved"
+"${script}" client_delete missingdir >/dev/null
+[[ ! -e "${home}/.config/safe_ssh/clients/missingdir" ]] ||
+  fail "missing remote SSH directory prevented local profile cleanup"
+mv "${TEST_REMOTE_HOME}/ssh.saved" "${TEST_REMOTE_HOME}/.ssh"
 
 # Connection proof is an explicit, strict dedicated-key command.
 calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
@@ -647,31 +703,39 @@ cp "${tmp_dir}/alpha.conf" "${alpha_snippet}"
 
 # Remote revocation failure retains all local state. Successful deletion removes
 # only that profile, and deleting the last profile removes only our Include.
-sed -i '/safe_ssh:alpha/d' "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys"
+sed -i '/safe_ssh:alpha/d' "${TEST_REMOTE_HOME}/.ssh/authorized_keys"
 printf '%s\n%s\n' \
   'from="192.0.2.1" ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_alpha changed-comment' \
   'ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_alpha duplicate-comment' \
-  >>"${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys"
+  >>"${TEST_REMOTE_HOME}/.ssh/authorized_keys"
 set +e
 TEST_SSH_DELETE_FAIL=1 "${script}" client_delete alpha >/dev/null
 status=$?
 set -e
 [[ "${status}" -ne 0 && -d "${alpha}" ]] || fail "failed revocation removed local state"
 cp "${beta}/id_ed25519.pub" "${alpha}/id_ed25519.pub"
+cp "${TEST_REMOTE_HOME}/.ssh/authorized_keys" "${tmp_dir}/authorized_keys.before-alpha-delete"
+backups_before_alpha_delete="$(find "${backup_dir}" -name '*.bak' | wc -l)"
 "${script}" client_delete alpha >/dev/null
 [[ ! -d "${alpha}" && -d "${beta}" ]] || fail "client deletion was not isolated"
-if grep -Fq "AAAA_SAFE_SSH_PUBLIC_KEY_alpha" "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys"; then
+[[ "$(find "${backup_dir}" -name '*.bak' | wc -l)" == "$((backups_before_alpha_delete + 1))" ]] ||
+  fail "content-changing revocation did not back up authorized_keys"
+alpha_delete_backup="$(find "${backup_dir}" -name '*.bak' \
+  -exec cmp -s "${tmp_dir}/authorized_keys.before-alpha-delete" {} \; -print -quit)"
+[[ -n "${alpha_delete_backup}" ]] ||
+  fail "revocation backup did not preserve the prior file"
+if grep -Fq "AAAA_SAFE_SSH_PUBLIC_KEY_alpha" "${TEST_REMOTE_HOME}/.ssh/authorized_keys"; then
   fail "remote revocation did not remove all forms of the public key"
 fi
-assert_file_contains "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys" "safe_ssh:beta"
+assert_file_contains "${TEST_REMOTE_HOME}/.ssh/authorized_keys" "safe_ssh:beta"
 assert_file_contains "${home}/.ssh/config" "# safe_ssh managed include"
 quoted_option_key='command="echo ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_beta done" ssh-ed25519 AAAA_UNRELATED quoted-option'
 quoted_comment='# ssh-ed25519 AAAA_SAFE_SSH_PUBLIC_KEY_beta is not a key'
 printf '%s\n%s\n' "${quoted_option_key}" "${quoted_comment}" \
-  >>"${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys"
+  >>"${TEST_REMOTE_HOME}/.ssh/authorized_keys"
 "${script}" client_delete beta >/dev/null
-assert_file_contains "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys" "${quoted_option_key}"
-assert_file_contains "${TEST_REMOTE_HOME}/.safe_ssh/authorized_keys" "${quoted_comment}"
+assert_file_contains "${TEST_REMOTE_HOME}/.ssh/authorized_keys" "${quoted_option_key}"
+assert_file_contains "${TEST_REMOTE_HOME}/.ssh/authorized_keys" "${quoted_comment}"
 [[ "$(grep -Fc '# safe_ssh managed include' "${home}/.ssh/config")" == 0 ]] ||
   fail "last deletion left managed include"
 assert_file_contains "${home}/.ssh/config" "Host existing"
