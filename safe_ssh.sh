@@ -29,7 +29,7 @@ LOG_FD=""
 usage() {
   cat <<'EOF'
 Usage:
-  safe_ssh.sh server_on --admin-user USER
+  safe_ssh.sh server_on
   safe_ssh.sh server_off
   safe_ssh.sh server_status
   safe_ssh.sh client_add NAME USER@HOST [--port PORT] [--bootstrap-identity PATH]
@@ -268,14 +268,6 @@ validate_port() {
   }
 }
 
-user_home() {
-  local record home
-  record="$(passwd_record "$1")" || return 1
-  IFS=: read -r _ _ _ _ _ home _ <<<"${record}"
-  [[ "${home}" == /* ]] || return 1
-  printf '%s\n' "${home}"
-}
-
 ensure_server_scope() {
   local os_release="${SAFE_SSH_OS_RELEASE:-/etc/os-release}" os_id os_like version
   [[ -r "${os_release}" ]] || { printf 'Error: Ubuntu or Debian is required.\n' >&2; return 1; }
@@ -355,31 +347,6 @@ server_policy_all_contexts_effective() {
   fi
 }
 
-standard_authorized_keys_effective() {
-  local effective="$1" auth
-  auth="$(awk 'tolower($1)=="authorizedkeysfile"{$1="";sub(/^ /,"");print;exit}' <<<"${effective}")"
-  [[ " ${auth} " == *" .ssh/authorized_keys "* ||
-     " ${auth} " == *" %h/.ssh/authorized_keys "* ]]
-}
-
-standard_authorized_keys_all_contexts_effective() {
-  local user="${1:-${INITIATOR_USER}}" effective context matched_status
-  effective="$(sshd_effective)" || return 1
-  standard_authorized_keys_effective "${effective}" || return 1
-  for context in \
-    "user=${user},host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=22" \
-    "user=${user},host=example.invalid,addr=192.0.2.1,laddr=192.0.2.2,lport=22"; do
-    effective="$("${SSHD_BIN}" -T -C "${context}")" || return 1
-    standard_authorized_keys_effective "${effective}" || return 1
-  done
-  if matched_policy_directive >/dev/null; then
-    return 1
-  else
-    matched_status=$?
-    [[ "${matched_status}" == 1 ]]
-  fi
-}
-
 reload_sshd() {
   "${SYSTEMCTL_BIN}" reload ssh.service 2>/dev/null ||
     "${SYSTEMCTL_BIN}" reload sshd.service
@@ -392,85 +359,6 @@ write_atomic() {
   cat >"${tmp}"
   chmod "${mode}" "${tmp}"
   mv -f "${tmp}" "${target}"
-}
-
-authorized_key_path_is_safe() {
-  local file="$1" home="$2" uid="$3" path owner mode stop="/"
-  if [[ "${file}" == "${home}"/* ]]; then
-    stop="${home}"
-  fi
-  path="${file}"
-  while :; do
-    [[ ! -L "${path}" ]] || return 1
-    read -r owner mode < <(stat -Lc '%u %a' -- "${path}") || return 1
-    [[ "${owner}" == 0 || "${owner}" == "${uid}" ]] || return 1
-    (( (8#${mode} & 8#022) == 0 )) || return 1
-    [[ "${path}" != "${stop}" ]] || break
-    path="$(dirname "${path}")"
-    [[ "${path}" != "." ]] || return 1
-  done
-}
-
-authorized_key_file_has_key() {
-  local file="$1" home="$2" uid="$3" line key_type
-  [[ -f "${file}" && ! -L "${file}" ]] || return 1
-  authorized_key_path_is_safe "${file}" "${home}" "${uid}" || return 1
-  while IFS= read -r line || [[ -n "${line}" ]]; do
-    read -r key_type _ <<<"${line}"
-    case "${key_type}" in
-      ssh-*|ecdsa-*|sk-*)
-        printf '%s\n' "${line}" |
-          ssh-keygen -lf /dev/stdin >/dev/null 2>&1 && return 0
-        ;;
-    esac
-  done <"${file}"
-  return 1
-}
-
-admin_has_key() {
-  local admin="$1" auth_values="$2" home uid token file
-  home="$(user_home "${admin}")" || return 1
-  uid="$(passwd_record "${admin}" | awk -F: '{print $3}')"
-  for token in ${auth_values}; do
-    [[ "${token}" != none ]] || continue
-    token="${token//%%/%}"
-    token="${token//%h/${home}}"
-    token="${token//%u/${admin}}"
-    token="${token//%U/${uid}}"
-    [[ "${token}" != *%* ]] || continue
-    if [[ "${token}" == /* ]]; then
-      file="${token}"
-    else
-      file="${home}/${token}"
-    fi
-    authorized_key_file_has_key "${file}" "${home}" "${uid}" && return 0
-  done
-  return 1
-}
-
-admin_login_probe() {
-  local admin="$1" effective port host=127.0.0.1
-  effective="$("${SSHD_BIN}" -T -C \
-    "user=${admin},host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=22")" ||
-    return 1
-  port="$(awk 'tolower($1)=="port"{print $2;exit}' <<<"${effective}")"
-  validate_port "${port:-22}" >/dev/null 2>&1 || return 1
-  if [[ -n "${SSH_CONNECTION:-}" ]]; then
-    read -r _ _ host _ <<<"${SSH_CONNECTION}"
-  fi
-  "${SSH_BIN}" -n \
-    -F /dev/null \
-    -o BatchMode=yes \
-    -o PreferredAuthentications=publickey \
-    -o PasswordAuthentication=no \
-    -o KbdInteractiveAuthentication=no \
-    -o ChallengeResponseAuthentication=no \
-    -o NumberOfPasswordPrompts=0 \
-    -o ConnectTimeout=10 \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    -o GlobalKnownHostsFile=/dev/null \
-    -p "${port:-22}" -l "${admin}" "${host}" true
 }
 
 server_policy_effective() {
@@ -509,16 +397,10 @@ sshd_service_active() {
 
 server_on() {
   require_root server_on
-  ensure_server_scope
-  local admin="" owned_state
   shift
-  while (($#)); do
-    case "$1" in
-      --admin-user) (($# >= 2)) || { printf 'Error: --admin-user needs USER\n' >&2; return 2; }; admin="$2"; shift 2 ;;
-      *) printf 'Error: unknown server_on option: %s\n' "$1" >&2; return 2 ;;
-    esac
-  done
-  [[ -n "${admin}" ]] || { printf 'Error: --admin-user USER is required\n' >&2; return 2; }
+  (($# == 0)) || { printf 'Error: server_on takes no arguments\n' >&2; usage >&2; return 2; }
+  ensure_server_scope
+  local confirmation="" owned_state
   owned_state=""
   if [[ -e "${OWNED_SSHD_CONFIG}" || -L "${OWNED_SSHD_CONFIG}" ]]; then
     owned_state="$(owned_server_state 2>/dev/null)" || {
@@ -529,7 +411,7 @@ server_on() {
   if [[ -n "${owned_state}" ]]; then
     if [[ "${owned_state}" == enabled ]] &&
        ! grep -Eiq '^[[:space:]]*AuthorizedKeysFile[[:space:]]+' "${OWNED_SSHD_CONFIG}"; then
-      if sshd_service_active && server_policy_all_contexts_effective "${admin}"; then
+      if sshd_service_active && server_policy_all_contexts_effective "${INITIATOR_USER}"; then
         printf 'safe_ssh server policy is already enabled.\n'
         return 0
       fi
@@ -539,20 +421,14 @@ server_on() {
     printf 'Error: legacy safe_ssh drop-in detected; run server_off before server_on\n' >&2
     return 1
   fi
-  phase server_baseline
-  standard_authorized_keys_all_contexts_effective "${admin}" || {
-    printf 'Error: standard .ssh/authorized_keys is not effective for %s; refusing possible lockout\n' "${admin}" >&2
+  printf '%s\n' \
+    'WARNING: A separate client public-key-only login test must already have succeeded.' \
+    'Password and keyboard-interactive authentication will be disabled; continuing can lock you out.' \
+    'Continue? Type exactly y to enable the server policy: ' >&2
+  if ! IFS= read -r confirmation || [[ "${confirmation}" != y ]]; then
+    printf 'Cancelled; server policy was not changed.\n' >&2
     return 1
-  }
-  admin_has_key "${admin}" ".ssh/authorized_keys" || {
-    printf 'Error: %s has no usable unconditional key in .ssh/authorized_keys; refusing possible lockout\n' "${admin}" >&2
-    return 1
-  }
-  phase server_login_probe
-  admin_login_probe "${admin}" || {
-    printf 'Error: public-key login probe for %s failed; refusing possible lockout\n' "${admin}" >&2
-    return 1
-  }
+  fi
   phase server_write
   {
     printf '%s\n%s\n' "${OWNED_HEADER}" "${ENABLED_MARKER}"
@@ -568,7 +444,7 @@ server_on() {
     rm -f "${OWNED_SSHD_CONFIG}"
     return 1
   fi
-  if ! server_policy_all_contexts_effective "${admin}"; then
+  if ! server_policy_all_contexts_effective "${INITIATOR_USER}"; then
     printf 'Error: safe_ssh policy is not effective in all checked SSH connection contexts; check Include ordering and Match blocks\n' >&2
     phase rollback
     rm -f "${OWNED_SSHD_CONFIG}"
