@@ -329,22 +329,38 @@ matched_policy_directive() {
 }
 
 server_policy_all_contexts_effective() {
-  local user="${1:-${INITIATOR_USER}}" effective context matched_status
-  effective="$(sshd_effective)" || return 1
-  server_policy_effective "${effective}" || return 1
-  for context in \
-    "user=${user},host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=22" \
-    "user=${user},host=example.invalid,addr=192.0.2.1,laddr=192.0.2.2,lport=22" \
-    "user=root,host=localhost,addr=::1,laddr=::1,lport=22"; do
-    effective="$("${SSHD_BIN}" -T -C "${context}")" || return 1
-    server_policy_effective "${effective}" || return 1
+  local user="${1:-${INITIATOR_USER}}" effective context label matched matched_status i
+  local contexts=(
+    "user=${user},host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=22"
+    "user=${user},host=example.invalid,addr=192.0.2.1,laddr=192.0.2.2,lport=22"
+    "user=root,host=localhost,addr=::1,laddr=::1,lport=22"
+  )
+  local labels=(user-local-ipv4 user-remote-ipv4 root-local-ipv6)
+  if ! effective="$(sshd_effective)"; then
+    printf 'Error: cannot evaluate sshd policy (context=default)\n' >&2
+    return 1
+  fi
+  validate_server_policy_effective "${effective}" default || return 1
+  for i in "${!contexts[@]}"; do
+    context="${contexts[i]}"
+    label="${labels[i]}"
+    if ! effective="$("${SSHD_BIN}" -T -C "${context}")"; then
+      printf 'Error: cannot evaluate sshd policy (context=%s)\n' "${label}" >&2
+      return 1
+    fi
+    validate_server_policy_effective "${effective}" "${label}" || return 1
   done
-  if matched_policy_directive >/dev/null; then
+  if matched="$(matched_policy_directive)"; then
+    printf 'Error: conditional SSH Match directive found: %s\n' "${matched}" >&2
     return 1
   else
     matched_status=$?
-    [[ "${matched_status}" == 1 ]]
+    if [[ "${matched_status}" != 1 ]]; then
+      printf 'Error: SSH Match inspection failed\n' >&2
+      return 1
+    fi
   fi
+  return 0
 }
 
 reload_sshd() {
@@ -371,6 +387,18 @@ server_policy_effective() {
      "${pass}" == no &&
      "${kbd}" == no &&
      "${methods}" == publickey ]]
+}
+
+validate_server_policy_effective() {
+  local effective="$1" context="$2" pub pass kbd methods
+  server_policy_effective "${effective}" && return 0
+  pub="$(awk 'tolower($1)=="pubkeyauthentication"{print tolower($2);exit}' <<<"${effective}")"
+  pass="$(awk 'tolower($1)=="passwordauthentication"{print tolower($2);exit}' <<<"${effective}")"
+  kbd="$(awk 'tolower($1)=="kbdinteractiveauthentication"{print tolower($2);exit}' <<<"${effective}")"
+  methods="$(awk 'tolower($1)=="authenticationmethods"{$1="";sub(/^ /,"");print tolower($0);exit}' <<<"${effective}")"
+  printf 'Error: sshd policy mismatch (context=%s, pubkey=%s, password=%s, keyboard_interactive=%s, authentication_methods=%s)\n' \
+    "${context}" "${pub:-missing}" "${pass:-missing}" "${kbd:-missing}" "${methods:-missing}" >&2
+  return 1
 }
 
 owned_server_state() {
@@ -445,7 +473,6 @@ server_on() {
     return 1
   fi
   if ! server_policy_all_contexts_effective "${INITIATOR_USER}"; then
-    printf 'Error: safe_ssh policy is not effective in all checked SSH connection contexts; check Include ordering and Match blocks\n' >&2
     phase rollback
     rm -f "${OWNED_SSHD_CONFIG}"
     return 1

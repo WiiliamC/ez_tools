@@ -35,6 +35,7 @@ set -euo pipefail
 printf '%s\n' "$*" >>"${TEST_SSHD_CALLS}"
 if [[ "$1" == -T ]]; then
   if [[ " $* " == *" -ddd "* ]]; then
+    [[ "${TEST_SSHD_FAIL_DEBUG:-0}" != 1 ]] || exit 1
     printf 'debug2: load_server_config: filename %s\n' "${TEST_SSHD_CONFIG}" >&2
     while IFS= read -r file; do
       printf 'debug2: load_server_config: filename %s\n' "${file}" >&2
@@ -42,6 +43,14 @@ if [[ "$1" == -T ]]; then
     if [[ -n "${TEST_SSHD_EXTRA_CONFIG:-}" ]]; then
       printf 'debug2: load_server_config: filename %s\n' "${TEST_SSHD_EXTRA_CONFIG}" >&2
     fi
+  fi
+  if [[ " $* " != *" -C "* && " $* " != *" -ddd "* &&
+        "${TEST_SSHD_FAIL_EFFECTIVE_DEFAULT:-0}" == 1 ]]; then
+    exit 1
+  fi
+  if [[ " $* " == *" -C "* && "$*" == *"host=example.invalid"* &&
+        "${TEST_SSHD_FAIL_EFFECTIVE_REMOTE:-0}" == 1 ]]; then
+    exit 1
   fi
   printf 'pubkeyauthentication yes\n'
   if [[ -f "${TEST_SSHD_DIR}/00-safe-ssh.conf" &&
@@ -345,25 +354,67 @@ grep -Fq -- '-ddd' "${TEST_SSHD_CALLS}" ||
 
 # A failed first enable removes its new drop-in.
 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
+reload_calls_before="$(grep -Ec '^reload ' "${TEST_SYSTEMCTL_CALLS}" || true)"
 set +e
-printf 'y\n' | TEST_SSHD_MATCH_WEAK=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on >/dev/null
+failure_output="$(printf 'y\n' |
+  TEST_SSHD_MATCH_WEAK=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+    "${script}" server_on 2>&1)"
 status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "server_on accepted a weak matched context"
+assert_contains "${failure_output}" \
+  "sshd policy mismatch (context=user-local-ipv4, pubkey=yes, password=yes"
 [[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] || fail "weak context left a drop-in"
 match_config="${tmp_dir}/match-user.conf"
 printf '%s\n' \
   'Match User bob' \
-  '    PasswordAuthentication yes' >"${match_config}"
+    '    PasswordAuthentication yes' >"${match_config}"
 set +e
-printf 'y\n' | TEST_SSHD_EXTRA_CONFIG="${match_config}" \
-  SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on >/dev/null
+failure_output="$(printf 'y\n' |
+  TEST_SSHD_EXTRA_CONFIG="${match_config}" \
+    SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on 2>&1)"
 status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "server_on accepted an unverified conditional SSH context"
+assert_contains "${failure_output}" \
+  "conditional SSH Match directive found: ${match_config}:1:Match User bob"
 [[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
   fail "conditional SSH context left a drop-in"
+
+set +e
+failure_output="$(printf 'y\n' |
+  TEST_SSHD_FAIL_EFFECTIVE_DEFAULT=1 \
+    SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on ignored default effective-config failure"
+assert_contains "${failure_output}" "cannot evaluate sshd policy (context=default)"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "default effective-config failure left a drop-in"
+
+set +e
+failure_output="$(printf 'y\n' |
+  TEST_SSHD_FAIL_EFFECTIVE_REMOTE=1 \
+    SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on ignored contextual effective-config failure"
+assert_contains "${failure_output}" "cannot evaluate sshd policy (context=user-remote-ipv4)"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "contextual effective-config failure left a drop-in"
+
+set +e
+failure_output="$(printf 'y\n' |
+  TEST_SSHD_FAIL_DEBUG=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+    "${script}" server_on 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on ignored SSH Match inspection failure"
+assert_contains "${failure_output}" "SSH Match inspection failed"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "SSH Match inspection failure left a drop-in"
+[[ "$(grep -Ec '^reload ' "${TEST_SYSTEMCTL_CALLS}" || true)" == "${reload_calls_before}" ]] ||
+  fail "server policy validation failure reloaded SSH"
 
 # Enabling validation and reload failures leave no new drop-in.
 set +e
