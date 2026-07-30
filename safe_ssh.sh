@@ -673,6 +673,194 @@ ssh_config_quote() {
   printf '"%s"' "${value}"
 }
 
+ssh_config_tokens() {
+  /usr/bin/python3 -c '
+import shlex
+import sys
+lexer = shlex.shlex(sys.argv[1], posix=True)
+lexer.whitespace_split = True
+lexer.commenters = "#"
+for token in lexer:
+    print(token)
+' "$1"
+}
+
+render_client_snippet() {
+  local name="$1" target="$2" port="$3" key="$4" known="$5"
+  local host="${6:-${name}}" target_host user
+  target_host="${target#*@}"; target_host="${target_host#[}"; target_host="${target_host%]}"
+  user="${target%@*}"
+  printf '%s\n' "${OWNED_HEADER}"
+  printf 'Host %s\n' "${host}"
+  printf '  HostName %s\n' "${target_host}"
+  printf '  User %s\n' "${user}"
+  printf '  Port %s\n' "${port}"
+  printf '  IdentityFile %s\n' "$(ssh_config_quote "${key}")"
+  printf '%s\n' '  IdentitiesOnly yes' '  ControlMaster no' '  ControlPath none'
+  printf '%s\n' '  PreferredAuthentications publickey' '  PasswordAuthentication no'
+  printf '%s\n' '  KbdInteractiveAuthentication no'
+  printf '  UserKnownHostsFile %s\n' "$(ssh_config_quote "${known}")"
+  printf '%s\n' '  GlobalKnownHostsFile /dev/null' '  StrictHostKeyChecking ask'
+}
+
+# Return success when NAME is already an explicit Host token in the user's
+# config (including files reached via Include).  This deliberately examines
+# only the per-user configuration tree, never the system ssh_config.
+ssh_config_host_collision() {
+  local name="$1" config scan_status
+  CLIENT_HOST_COLLISION_SOURCE=""
+  SSH_CONFIG_SCAN_UNSUPPORTED=""
+  SSH_CONFIG_HOST_ACTIVE=1
+  SSH_CONFIG_MATCH_CONTEXT=0
+  config="${INITIATOR_HOME}/.ssh/config"
+  [[ -f "${config}" && ! -L "${config}" ]] || return 1
+  declare -gA ACTIVE_SSH_CONFIGS=()
+  if scan_ssh_config_for_host "${config}" "${name}"; then
+    return 0
+  else
+    scan_status=$?
+  fi
+  if [[ -n "${SSH_CONFIG_SCAN_UNSUPPORTED}" ]]; then
+    printf 'Error: %s\n' "${SSH_CONFIG_SCAN_UNSUPPORTED}" >&2
+    return 2
+  fi
+  return "${scan_status}"
+}
+
+host_patterns_match() {
+  local name="$1" token pattern positive=0 matched=0
+  shift
+  shopt -s nocasematch
+  for token in "$@"; do
+    if [[ "${token}" == \!* ]]; then
+      pattern="${token#!}"
+      [[ "${name}" == ${pattern} ]] && { shopt -u nocasematch; return 1; }
+    else
+      positive=1
+      [[ "${name}" == ${token} ]] && matched=1
+    fi
+  done
+  shopt -u nocasematch
+  ((positive && matched))
+}
+
+owned_snippet_for_name() {
+  local file="$1" name="$2" expected profile target port key known
+  expected="$(client_root)/ssh_config.d/${name}.conf"
+  profile="$(client_root)/clients/${name}/profile"
+  [[ "${file}" == "${expected}" && ! -L "${file}" && -f "${profile}" && ! -L "${profile}" ]] || return 1
+  target="$(sed -n 's/^TARGET=//p' "${profile}")"
+  port="$(sed -n 's/^PORT=//p' "${profile}")"
+  validate_target "${target}" >/dev/null 2>&1 && validate_port "${port}" >/dev/null 2>&1 || return 1
+  key="$(client_root)/clients/${name}/id_ed25519"
+  known="$(client_root)/clients/${name}/known_hosts"
+  cmp -s <(render_client_snippet "${name}" "${target}" "${port}" "${key}" "${known}") "${file}" ||
+    cmp -s <(render_client_snippet "${name}" "${target}" "${port}" "${key}" "${known}" \
+      "safe-ssh-${name}") "${file}"
+}
+
+expand_ssh_include_path() {
+  local path="$1" user record home suffix=""
+  case "${path}" in
+    "~")
+      printf '%s\n' "${INITIATOR_HOME}"
+      ;;
+    "~/"*)
+      printf '%s/%s\n' "${INITIATOR_HOME}" "${path#\~/}"
+      ;;
+    "~"*)
+      user="${path#\~}"
+      if [[ "${user}" == */* ]]; then
+        suffix="/${user#*/}"
+        user="${user%%/*}"
+      fi
+      record="$(passwd_record "${user}" 2>/dev/null)" || return 1
+      IFS=: read -r _ _ _ _ _ home _ <<<"${record}"
+      [[ "${home}" == /* ]] || return 1
+      printf '%s%s\n' "${home}" "${suffix}"
+      ;;
+    /*)
+      printf '%s\n' "${path}"
+      ;;
+    *)
+      printf '%s/.ssh/%s\n' "${INITIATOR_HOME}" "${path}"
+      ;;
+  esac
+}
+
+scan_ssh_config_for_host() {
+  local file="$1" name="$2" canonical line keyword remainder token include_path candidate
+  local -a tokens
+  canonical="$(readlink -f -- "${file}" 2>/dev/null || true)"
+  [[ -n "${canonical}" && -f "${canonical}" ]] || return 1
+  [[ -z "${ACTIVE_SSH_CONFIGS[${canonical}]:-}" ]] || return 1
+  ACTIVE_SSH_CONFIGS["${canonical}"]=1
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -n "${line}" && "${line}" != \#* ]] || continue
+    if [[ "${line}" =~ ^([[:alnum:]_]+)[[:space:]]*(=)?[[:space:]]*(.*)$ ]]; then
+      keyword="${BASH_REMATCH[1]}"
+      remainder="${BASH_REMATCH[3]}"
+    else
+      continue
+    fi
+    case "${keyword,,}" in
+      host)
+        mapfile -t tokens < <(ssh_config_tokens "${remainder}")
+        for token in "${tokens[@]}"; do
+          [[ "${token}" == \!* || "${token}" == *\* || "${token}" == *\? ]] && continue
+          if [[ "${token,,}" == "${name,,}" ]] &&
+              ! owned_snippet_for_name "${file}" "${name}"; then
+            CLIENT_HOST_COLLISION_SOURCE="${file}"
+            unset 'ACTIVE_SSH_CONFIGS['"${canonical}"']'
+            return 0
+          fi
+        done
+        if host_patterns_match "${name}" "${tokens[@]}"; then
+          SSH_CONFIG_HOST_ACTIVE=1
+        else
+          SSH_CONFIG_HOST_ACTIVE=0
+        fi
+        ;;
+      include)
+        if ((SSH_CONFIG_MATCH_CONTEXT)); then
+          printf -v SSH_CONFIG_SCAN_UNSUPPORTED \
+            'cannot safely inspect SSH Match block in %s' "${file}"
+          unset 'ACTIVE_SSH_CONFIGS['"${canonical}"']'
+          return 1
+        fi
+        ((SSH_CONFIG_HOST_ACTIVE)) || continue
+        mapfile -t tokens < <(ssh_config_tokens "${remainder}")
+        for include_path in "${tokens[@]}"; do
+          if ! include_path="$(expand_ssh_include_path "${include_path}")"; then
+            printf -v SSH_CONFIG_SCAN_UNSUPPORTED \
+              'cannot resolve SSH Include path in %s' "${file}"
+            unset 'ACTIVE_SSH_CONFIGS['"${canonical}"']'
+            return 1
+          fi
+          while IFS= read -r candidate; do
+            if scan_ssh_config_for_host "${candidate}" "${name}"; then
+              unset 'ACTIVE_SSH_CONFIGS['"${canonical}"']'
+              return 0
+            fi
+            if [[ -n "${SSH_CONFIG_SCAN_UNSUPPORTED}" ]]; then
+              unset 'ACTIVE_SSH_CONFIGS['"${canonical}"']'
+              return 1
+            fi
+          done < <(compgen -G "${include_path}" | sort)
+        done
+        ;;
+      match)
+        SSH_CONFIG_MATCH_CONTEXT=1
+        SSH_CONFIG_HOST_ACTIVE=0
+        ;;
+    esac
+    [[ "${keyword,,}" == host ]] && SSH_CONFIG_MATCH_CONTEXT=0
+  done <"${file}"
+  unset 'ACTIVE_SSH_CONFIGS['"${canonical}"']'
+  return 1
+}
+
 install_include() {
   local ssh_dir="${INITIATOR_HOME}/.ssh" config tmp filtered include
   config="${ssh_dir}/config"
@@ -989,7 +1177,7 @@ REMOTE
 }
 
 client_add() {
-  local name="${2:-}" target="${3:-}" port=22 bootstrap="" root dir profile key public fingerprint known snippet remote_key target_host ssh_target authorization_completed=0
+  local name="${2:-}" target="${3:-}" port=22 bootstrap="" root dir profile key public fingerprint known snippet remote_key target_host ssh_target authorization_completed=0 collision_status
   [[ -n "${name}" && -n "${target}" ]] || { usage; return 2; }
   validate_name "${name}"
   validate_target "${target}"
@@ -1005,6 +1193,14 @@ client_add() {
       *) printf 'Error: unknown client_add option: %s\n' "$1" >&2; return 2 ;;
     esac
   done
+  if ssh_config_host_collision "${name}"; then
+    printf 'Error: client name %s conflicts with explicit Host in %s\n' \
+      "${name}" "${CLIENT_HOST_COLLISION_SOURCE}" >&2
+    return 1
+  else
+    collision_status=$?
+    ((collision_status == 2)) && return 1
+  fi
   ensure_client_layout
   root="$(client_root)"; dir="${root}/clients/${name}"; profile="${dir}/profile"; key="${dir}/id_ed25519"
   public="${key}.pub"; known="${dir}/known_hosts"; snippet="${root}/ssh_config.d/${name}.conf"
@@ -1062,25 +1258,10 @@ client_add() {
       printf 'TARGET=%s\nPORT=%s\nAUTHORIZATION_COMPLETED=1\n' "${target}" "${port}"
     } | write_atomic "${profile}" 600
   fi
-  {
-    printf '%s\n' "${OWNED_HEADER}"
-    printf 'Host safe-ssh-%s\n' "${name}"
-    printf '  HostName %s\n' "${target_host}"
-    printf '  User %s\n' "${target%@*}"
-    printf '  Port %s\n' "${port}"
-    printf '  IdentityFile %s\n' "$(ssh_config_quote "${key}")"
-    printf '  IdentitiesOnly yes\n'
-    printf '  ControlMaster no\n'
-    printf '  ControlPath none\n'
-    printf '  PreferredAuthentications publickey\n'
-    printf '  PasswordAuthentication no\n'
-    printf '  KbdInteractiveAuthentication no\n'
-    printf '  UserKnownHostsFile %s\n' "$(ssh_config_quote "${known}")"
-    printf '  GlobalKnownHostsFile /dev/null\n'
-    printf '  StrictHostKeyChecking ask\n'
-  } | write_atomic "${snippet}" 600
+  render_client_snippet "${name}" "${target}" "${port}" "${key}" "${known}" |
+    write_atomic "${snippet}" 600
   install_include
-  printf 'client %s configured as Host safe-ssh-%s\n' "${name}" "${name}"
+  printf 'client %s configured as Host %s\n' "${name}" "${name}"
 }
 
 load_profile() {
@@ -1221,7 +1402,7 @@ status_one() {
     printf '%s: local-only (%s)\n' "${name}" "${TARGET}"
     return 1
   fi
-  alias="safe-ssh-${name}"
+  alias="${name}"
   if ! effective="$(ssh -G "${alias}" 2>/dev/null)"; then
     printf '%s: local-only (%s)\n' "${name}" "${TARGET}"
     return 1

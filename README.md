@@ -37,7 +37,7 @@ sudo ./safe_ssh.sh server_off
 ```
 
 Each client name gets its own unencrypted Ed25519 key, dedicated `known_hosts`,
-metadata, and `Host safe-ssh-NAME` snippet under
+metadata, and `Host NAME` snippet under
 `${XDG_CONFIG_HOME:-$HOME/.config}/safe_ssh/`. The one marked `Include` at the
 top of `~/.ssh/config` exposes those aliases without changing unrelated hosts
 or identity selection. First use asks you to confirm the host key. A later host
@@ -47,7 +47,11 @@ key mismatch is refused and is never automatically replaced.
 or `unauthorized` so local configuration failures can be distinguished from
 network and authentication failures.
 
-`client_add` uses your existing SSH access to install the new public key.
+`client_add` uses your existing SSH access to install the new public key. It
+refuses a name already defined explicitly in your `~/.ssh/config` or its
+included files, so it never silently takes over an existing SSH alias.
+An `Include` inside a `Match` block is rejected because its applicability
+cannot be checked safely without executing the conditional configuration.
 `client_test` separately verifies that the dedicated identity works with
 public-key authentication only. Repeating the same name and target is safe;
 reusing a name for another target is refused. `client_delete` revokes the exact
@@ -66,8 +70,8 @@ them.
 The aliases work with standard tools:
 
 ```bash
-ssh safe-ssh-home
-scp ./backup.tar safe-ssh-home:/srv/backups/
+ssh home
+scp ./backup.tar home:/srv/backups/
 rclone copy ./photos :sftp:/data/photos \
   --sftp-host ssh.example.com \
   --sftp-user alice \
@@ -82,7 +86,7 @@ For a cpolar TCP tunnel, start the tunnel on the SSH server (for example,
 
 ```bash
 ./safe_ssh.sh client_add tunneled alice@example.cpolar.cn --port 12345
-ssh safe-ssh-tunneled
+ssh tunneled
 ```
 
 Every invocation writes a complete private log under the initiating user's

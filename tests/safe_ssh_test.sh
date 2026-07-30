@@ -116,7 +116,7 @@ if [[ " $* " == *" PreferredAuthentications=publickey "* &&
   exit 255
 fi
 if [[ "${1:-}" == -G ]]; then
-  name="${2#safe-ssh-}"
+  name="$2"
   snippet="${XDG_CONFIG_HOME}/safe_ssh/ssh_config.d/${name}.conf"
   awk '
     function value() {
@@ -423,9 +423,87 @@ set -e
 [[ "${status}" -ne 0 && ! -e "${home}/.config/safe_ssh/clients/Foo" ]] ||
   fail "uppercase client name was accepted"
 
-printf 'ServerAliveInterval 30\nHost existing\n  IdentityFile ~/.ssh/existing\n' >"${home}/.ssh/config"
+mkdir -p "${home}/.ssh/config.d"
+printf 'Host Wild* !blocked\nHost shared BLOCKED\n' >"${home}/.ssh/config.d/hosts.conf"
+printf 'Include = config.d/hosts.conf\n' >"${home}/.ssh/config.d/nested.conf"
+printf 'Host hidden\n' >"${home}/.ssh/config.d/inactive.conf"
+printf 'Host tildeuser\n' >"${home}/.ssh/config.d/tilde-user.conf"
+printf 'Host other\n' >"${home}/.ssh/config.d/repeated.conf"
+printf 'Host replayed\n' >"${home}/.ssh/config.d/replayed.conf"
+printf 'ServerAliveInterval 30\nInclude = config.d/nested.conf\nHost *\nInclude ~%s/.ssh/config.d/tilde-user.conf\nHost=equalhost\nHost existing\n  IdentityFile ~/.ssh/existing\nHost safe-ssh-prefixed\nHost other\n  Include config.d/inactive.conf\nHost replay*\n  Include config.d/repeated.conf\nHost replay*\n  Include config.d/repeated.conf\n  Include config.d/replayed.conf\nHost *\n' \
+  "$(id -un)" >"${home}/.ssh/config"
+
+# Explicit user Host names, including names in reached Include files and
+# multi-token Host lines, reserve a client name before any local or remote
+# state is created.  Wildcards and negated tokens do not reserve it.
+calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
+set +e
+collision_output="$("${script}" client_add blocked alice@example.test 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "existing SSH Host name was accepted"
+assert_contains "${collision_output}" "blocked"
+assert_contains "${collision_output}" "${home}/.ssh/config.d/hosts.conf"
+[[ ! -e "${home}/.config/safe_ssh/clients/blocked" &&
+   ! -e "${home}/.config/safe_ssh/ssh_config.d/blocked.conf" ]] ||
+  fail "Host collision created local client state"
+[[ "$(wc -l <"${TEST_SSH_CALLS}")" == "${calls_before}" ]] ||
+  fail "Host collision attempted remote authorization"
+set +e
+collision_output="$("${script}" client_add existing alice@example.test 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "main SSH config Host name was accepted"
+assert_contains "${collision_output}" "${home}/.ssh/config"
+[[ ! -e "${home}/.config/safe_ssh/clients/existing" ]] ||
+  fail "main-config Host collision created local client state"
+set +e
+collision_output="$("${script}" client_add equalhost alice@example.test 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "Host=NAME collision was accepted"
+assert_contains "${collision_output}" "${home}/.ssh/config"
+[[ ! -e "${home}/.config/safe_ssh/clients/equalhost" ]] ||
+  fail "Host=NAME collision created local client state"
+set +e
+collision_output="$("${script}" client_add tildeuser alice@example.test 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "~user SSH Include collision was accepted"
+assert_contains "${collision_output}" "${home}/.ssh/config.d/tilde-user.conf"
+
+# Repeated Includes are replayed in their current Host context.  The second
+# pass changes the active context, so the following Include is inactive.
+"${script}" client_add replayed alice@example.test >/dev/null
+"${script}" client_delete replayed >/dev/null
+"${script}" client_add wild alice@example.test >/dev/null
+"${script}" client_delete wild >/dev/null
+"${script}" client_add prefixed alice@example.test >/dev/null
+"${script}" client_delete prefixed >/dev/null
 mkdir -p "${TEST_REMOTE_HOME}/.ssh"
 chmod 777 "${TEST_REMOTE_HOME}/.ssh"
+"${script}" client_add hidden alice@example.test >/dev/null
+"${script}" client_delete hidden >/dev/null
+
+# Match blocks without Includes do not prevent collision scanning, while an
+# Include whose applicability depends on Match fails closed before side effects.
+printf 'Match host elsewhere\n  ServerAliveInterval 10\nHost *\n' >>"${home}/.ssh/config"
+"${script}" client_add matched alice@example.test >/dev/null
+"${script}" client_delete matched >/dev/null
+printf 'Match host elsewhere\n  Include config.d/inactive.conf\n' >>"${home}/.ssh/config"
+calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
+set +e
+collision_output="$("${script}" client_add matchinclude alice@example.test 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "Match-conditional Include did not fail closed"
+assert_contains "${collision_output}" "cannot safely inspect SSH Match block"
+[[ ! -e "${home}/.config/safe_ssh/clients/matchinclude" ]] ||
+  fail "unsupported Match Include created local client state"
+[[ "$(wc -l <"${TEST_SSH_CALLS}")" == "${calls_before}" ]] ||
+  fail "unsupported Match Include attempted remote authorization"
+sed -i '$d' "${home}/.ssh/config"
+sed -i '$d' "${home}/.ssh/config"
 
 # A failed initial authorization can be discarded explicitly without requiring
 # access to the unreachable target, freeing the profile name for reuse.
@@ -509,8 +587,11 @@ set -e
   fail "local-only deletion discarded an authorized profile"
 [[ "$(wc -l <"${TEST_SSH_CALLS}")" == "${calls_before}" ]] ||
   fail "rejected local-only deletion attempted remote revocation"
-assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/alpha.conf" "Host safe-ssh-alpha"
-assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/beta.conf" "Host safe-ssh-beta"
+assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/alpha.conf" "Host alpha"
+assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/beta.conf" "Host beta"
+if grep -Fq 'Host safe-ssh-' "${home}/.config/safe_ssh/ssh_config.d/alpha.conf"; then
+  fail "generated SSH snippet retained compatibility alias"
+fi
 assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/alpha.conf" \
   "GlobalKnownHostsFile /dev/null"
 assert_file_contains "${home}/.config/safe_ssh/ssh_config.d/alpha.conf" \
@@ -588,6 +669,16 @@ assert_contains "${retry_calls}" "HostName=example.test"
 [[ "$(find "${backup_dir}" -type f | wc -l)" == "${backups_before_retry}" ]] ||
   fail "idempotent authorization created a backup"
 
+# Re-adding an existing profile upgrades its exact legacy managed snippet to
+# the direct Host name without mistaking that snippet for a user collision.
+alpha_snippet="${home}/.config/safe_ssh/ssh_config.d/alpha.conf"
+sed -i 's/^Host alpha$/Host safe-ssh-alpha/' "${alpha_snippet}"
+"${script}" client_add alpha alice@example.test --port 2222 >/dev/null
+assert_file_contains "${alpha_snippet}" "Host alpha"
+if grep -Fq 'Host safe-ssh-alpha' "${alpha_snippet}"; then
+  fail "legacy managed snippet was not upgraded"
+fi
+
 # Revoking a key that is present only in a comment is also idempotent.
 "${script}" client_add noop alice@example.test >/dev/null
 sed -i '/safe_ssh:noop/d' "${TEST_REMOTE_HOME}/.ssh/authorized_keys"
@@ -643,6 +734,7 @@ set -e
 status_output="$("${script}" client_status)"
 assert_contains "${status_output}" "alpha: ready"
 assert_contains "${status_output}" "beta: ready"
+assert_file_contains "${TEST_SSH_CALLS}" "-G alpha"
 status_output="$(TEST_SSH_G_LITERAL_DISABLED=1 "${script}" client_status alpha)"
 assert_contains "${status_output}" "alpha: ready"
 set +e
@@ -784,6 +876,11 @@ assert_file_contains "${spaced_root}/ssh_config.d/spaced.conf" \
   "IdentityFile \"${spaced_root}/clients/spaced/id_ed25519\""
 status_output="$("${script}" client_status spaced)"
 assert_contains "${status_output}" "spaced: ready"
+"${script}" client_add spaced erin@example.space >/dev/null
+assert_file_contains "${spaced_root}/ssh_config.d/spaced.conf" "Host spaced"
+if grep -Fq 'Host safe-ssh-spaced' "${spaced_root}/ssh_config.d/spaced.conf"; then
+  fail "spaced profile retained compatibility alias"
+fi
 "${script}" client_delete spaced >/dev/null
 TEST_HOME="${home}"
 HOME="${home}"
