@@ -87,20 +87,47 @@ rclone copy ./photos :sftp:/data/photos \
   --sftp-known-hosts-file ~/.config/safe_ssh/clients/home/known_hosts
 ```
 
-For a cpolar TCP tunnel, start the tunnel on the SSH server (for example,
-`cpolar tcp 22`), then use the hostname and port shown by cpolar as the
-`USER@HOST` and `--port` values:
+Every `safe_ssh.sh` invocation writes a complete private log under the
+initiating user's `~/.safe_ssh/logs/`. With `sudo`, that user and home are
+resolved from `SUDO_USER` via the passwd database. Logs contain phases, command
+output, rollback and exit status, but redact secrets and record only key type
+and fingerprint.
+
+## publish_ssh_by_cpolar.sh
+
+`publish_ssh_by_cpolar.sh` uses cpolar's installed `cpolar.service`; it does
+not start a separate foreground process or manage a PID file. Before enabling
+the service, it validates `/usr/local/etc/cpolar/cpolar.yml` with
+`cpolar list -config=...` and requires the following named tunnel. Add it to
+the existing configuration,
+preserving its existing `authtoken` rather than copying it into commands or
+documentation:
+
+```yaml
+tunnels:
+  ssh:
+    proto: tcp
+    addr: "22"
+```
+
+Then run the no-argument wrapper on the SSH server. It enables and restarts
+`cpolar.service` (with `sudo` when needed), so configuration changes take
+effect even if the service is already active:
+
+```bash
+./publish_ssh_by_cpolar.sh
+systemctl status cpolar
+journalctl -u cpolar
+sudo tail -f /var/log/cpolar/access.log
+```
+
+Use the public hostname and port shown by cpolar as the `USER@HOST` and
+`--port` values:
 
 ```bash
 ./safe_ssh.sh client_add tunneled alice@example.cpolar.cn --port 12345
 ssh tunneled
 ```
-
-Every invocation writes a complete private log under the initiating user's
-`~/.safe_ssh/logs/`. With `sudo`, that user and home are resolved from
-`SUDO_USER` via the passwd database. Logs contain phases, command output,
-rollback and exit status, but redact secrets and record only key type and
-fingerprint.
 
 ## until_success.sh
  
