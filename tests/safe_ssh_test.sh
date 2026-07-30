@@ -33,15 +33,24 @@ cat >"${tmp_dir}/bin/sshd" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"${TEST_SSHD_CALLS}"
+debug_printf() {
+  if [[ "${TEST_SSHD_DEBUG_LF_ONLY:-0}" == 1 ]]; then
+    printf '%s\n' "$*" >&2
+  else
+    printf '%s\r\n' "$*" >&2
+  fi
+}
 if [[ "$1" == -T ]]; then
   if [[ " $* " == *" -ddd "* ]]; then
     [[ "${TEST_SSHD_FAIL_DEBUG:-0}" != 1 ]] || exit 1
-    printf 'debug2: load_server_config: filename %s\n' "${TEST_SSHD_CONFIG}" >&2
-    while IFS= read -r file; do
-      printf 'debug2: load_server_config: filename %s\n' "${file}" >&2
-    done < <(find -L "${TEST_SSHD_DIR}" -type f | sort)
-    if [[ -n "${TEST_SSHD_EXTRA_CONFIG:-}" ]]; then
-      printf 'debug2: load_server_config: filename %s\n' "${TEST_SSHD_EXTRA_CONFIG}" >&2
+    if [[ "${TEST_SSHD_DEBUG_NO_FILES:-0}" != 1 ]]; then
+      debug_printf "debug2: load_server_config: filename ${TEST_SSHD_CONFIG}"
+      while IFS= read -r file; do
+        debug_printf "debug2: load_server_config: filename ${file}"
+      done < <(find -L "${TEST_SSHD_DIR}" -type f | sort)
+      if [[ -n "${TEST_SSHD_EXTRA_CONFIG:-}" ]]; then
+        debug_printf "debug2: load_server_config: filename ${TEST_SSHD_EXTRA_CONFIG}"
+      fi
     fi
   fi
   if [[ " $* " != *" -C "* && " $* " != *" -ddd "* &&
@@ -351,6 +360,10 @@ SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
   fail "idempotent server_on invoked ssh"
 grep -Fq -- '-ddd' "${TEST_SSHD_CALLS}" ||
   fail "server policy validation did not inspect conditional SSH contexts"
+TEST_SSHD_DEBUG_LF_ONLY=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on </dev/null >/dev/null
+[[ "$(sha256sum "${TEST_SSHD_DIR}/00-safe-ssh.conf")" == "${enabled_checksum}" ]] ||
+  fail "LF-only Match inspection rewrote the enabled drop-in"
 
 # A failed first enable removes its new drop-in.
 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
@@ -413,6 +426,17 @@ set -e
 assert_contains "${failure_output}" "SSH Match inspection failed"
 [[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
   fail "SSH Match inspection failure left a drop-in"
+
+set +e
+failure_output="$(printf 'y\n' |
+  TEST_SSHD_DEBUG_NO_FILES=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+    "${script}" server_on 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on accepted an empty SSH config inspection"
+assert_contains "${failure_output}" "SSH Match inspection failed"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "empty SSH config inspection left a drop-in"
 [[ "$(grep -Ec '^reload ' "${TEST_SYSTEMCTL_CALLS}" || true)" == "${reload_calls_before}" ]] ||
   fail "server policy validation failure reloaded SSH"
 

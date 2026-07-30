@@ -299,6 +299,9 @@ matched_policy_directive() {
   local debug file line matched files=()
   debug="$("${SSHD_BIN}" -T -ddd 2>&1)" || return 2
   while IFS= read -r line; do
+    # OpenSSH writes debug logs to stderr using CRLF.  read removes the LF but
+    # leaves the CR, which must not become part of a parsed config path.
+    line="${line%$'\r'}"
     case "${line}" in
       *"load_server_config: filename "*)
         file="${line#*load_server_config: filename }"
