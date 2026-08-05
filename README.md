@@ -184,10 +184,10 @@ The script tags its crontab entries with clear markers and only modifies those m
 
 ## port_forward.sh
 
-Manages TCP port forwarding rules on Linux with `iptables` DNAT/MASQUERADE.
+Manages TCP port forwarding rules on Linux with `iptables` DNAT/MASQUERADE. The target may be an IPv4 address or a host from the invoking user's SSH configuration.
 
 ```bash
-sudo ./port_forward.sh add <local_port> <target_ip> <target_port>
+sudo ./port_forward.sh add <local_port> <target_host> <target_port>
 sudo ./port_forward.sh remove <local_port>
 sudo ./port_forward.sh list
 sudo ./port_forward.sh flush
@@ -197,13 +197,14 @@ Example:
 
 ```bash
 sudo ./port_forward.sh add 8080 10.0.0.5 80
+sudo ./port_forward.sh add 8080 ms5090 80
 ```
 
-This forwards TCP traffic received by the forwarding server on port `8080` to `10.0.0.5:80`. The script enables IPv4 forwarding when needed and tags its `iptables` rules so `list`, `remove`, and `flush` only operate on rules it manages.
+These examples forward TCP traffic received by the forwarding server on port `8080` to port `80` on the target. For an SSH host such as `ms5090`, the script runs `ssh -G` as the user who invoked `sudo`, reads its `HostName`, and resolves it to a fixed IPv4 address before creating the rules. `User`, `Port`, and identity settings from SSH configuration are not used, and aliases that require `ProxyJump` or `ProxyCommand` are rejected because this is not an SSH tunnel. The script enables IPv4 forwarding when needed and tags its `iptables` rules so `list`, `remove`, and `flush` only operate on rules it manages.
 
 Lifecycle:
 
-The forwarding rules do not expire on their own and are not tied to the script process after `add` finishes. They remain active while the corresponding `iptables` rules and IPv4 forwarding setting remain in place.
+The forwarding rules do not expire on their own and are not tied to the script process after `add` finishes. They remain active while the corresponding `iptables` rules and IPv4 forwarding setting remain in place. SSH host names are resolved only when a rule is added, so later SSH configuration or DNS changes do not update existing rules; `list` shows the IPv4 address actually stored in iptables.
 
 Forwarding is closed when you run `remove <local_port>` for that port, run `flush` for all rules managed by this script, manually delete or replace the related `iptables` rules, disable IPv4 forwarding, or when another firewall manager such as `ufw` or `firewalld` reloads and rewrites the rules. The rules added by this script are not persisted with `iptables-save`, `netfilter-persistent`, or a systemd startup unit, so they usually do not survive a system reboot unless the host has separate `iptables` persistence configured.
 
