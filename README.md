@@ -2,6 +2,22 @@
 
 A collection of utility tools for Linux systems.
 
+## install_fcitx5_pinyin.sh
+
+Installs Ubuntu/Debian's Fcitx5 packages and configures built-in Pinyin, Baidu
+cloud candidates (second candidate), prediction, and the Material black theme.
+Run it as the logged-in desktop user, not through `sudo`:
+
+```bash
+./install_fcitx5_pinyin.sh          # same as install
+./install_fcitx5_pinyin.sh status
+./install_fcitx5_pinyin.sh help
+fcitx5-config-qt                    # optional GUI configuration
+```
+
+Log out and back in after installation. Cloud Pinyin sends lookup queries to
+Baidu; use the Fcitx5 GUI or remove the cloud settings if that is unsuitable.
+
 ## safe_ssh.sh
 
 Creates isolated, public-key-only SSH access profiles. Server management is
