@@ -22,11 +22,11 @@ file did not exist). Repeating an already-applied operation creates no backup.
 # 2. Prove that the dedicated key can connect without fallback authentication.
 ./safe_ssh.sh client_test home
 
-# 3. Optionally, back on the server, require public-key authentication. The
-# administrator must have a safe, usable key in the effective standard
-# ~/.ssh/authorized_keys, and its private key or forwarded agent must be
-# available to the sudo invocation for a public-key login probe.
-sudo ./safe_ssh.sh server_on --admin-user alice
+# 3. Optionally, back on the server, require public-key authentication. Only do
+# this after the separate client_test above has succeeded. Confirm the warning
+# with an exact lowercase y; disabling password and keyboard-interactive
+# authentication can lock you out.
+sudo ./safe_ssh.sh server_on
 
 sudo ./safe_ssh.sh server_status
 sudo ./safe_ssh.sh server_off
@@ -60,6 +60,13 @@ retained if revocation fails. If initial authorization never succeeded and the
 target cannot be reached, `client_delete NAME --local-only` explicitly removes
 only the local profile without attempting remote revocation.
 
+`server_on` does not inspect `AuthorizedKeysFile`, local key files, or attempt
+an SSH login. Verifying a separate public-key-only client login before enabling
+the policy is the operator's responsibility. The first enable requires an exact
+lowercase `y`; any other response or end-of-input cancels without changing the
+configuration or reloading SSH. Repeating `server_on` after the managed policy
+is effectively enabled is idempotent and does not prompt again.
+
 Upgrade note: there is no automatic migration from older `server_prepare`
 installations. Re-run each client profile with `client_add`, verify it with
 `client_test`, run `sudo ./safe_ssh.sh server_off` to remove the legacy managed
@@ -80,20 +87,47 @@ rclone copy ./photos :sftp:/data/photos \
   --sftp-known-hosts-file ~/.config/safe_ssh/clients/home/known_hosts
 ```
 
-For a cpolar TCP tunnel, start the tunnel on the SSH server (for example,
-`cpolar tcp 22`), then use the hostname and port shown by cpolar as the
-`USER@HOST` and `--port` values:
+Every `safe_ssh.sh` invocation writes a complete private log under the
+initiating user's `~/.safe_ssh/logs/`. With `sudo`, that user and home are
+resolved from `SUDO_USER` via the passwd database. Logs contain phases, command
+output, rollback and exit status, but redact secrets and record only key type
+and fingerprint.
+
+## publish_ssh_by_cpolar.sh
+
+`publish_ssh_by_cpolar.sh` uses cpolar's installed `cpolar.service`; it does
+not start a separate foreground process or manage a PID file. Before enabling
+the service, it validates `/usr/local/etc/cpolar/cpolar.yml` with
+`cpolar list -config=...` and requires the following named tunnel. Add it to
+the existing configuration,
+preserving its existing `authtoken` rather than copying it into commands or
+documentation:
+
+```yaml
+tunnels:
+  ssh:
+    proto: tcp
+    addr: "22"
+```
+
+Then run the no-argument wrapper on the SSH server. It enables and restarts
+`cpolar.service` (with `sudo` when needed), so configuration changes take
+effect even if the service is already active:
+
+```bash
+./publish_ssh_by_cpolar.sh
+systemctl status cpolar
+journalctl -u cpolar
+sudo tail -f /var/log/cpolar/access.log
+```
+
+Use the public hostname and port shown by cpolar as the `USER@HOST` and
+`--port` values:
 
 ```bash
 ./safe_ssh.sh client_add tunneled alice@example.cpolar.cn --port 12345
 ssh tunneled
 ```
-
-Every invocation writes a complete private log under the initiating user's
-`~/.safe_ssh/logs/`. With `sudo`, that user and home are resolved from
-`SUDO_USER` via the passwd database. Logs contain phases, command output,
-rollback and exit status, but redact secrets and record only key type and
-fingerprint.
 
 ## until_success.sh
  

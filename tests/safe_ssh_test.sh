@@ -33,15 +33,33 @@ cat >"${tmp_dir}/bin/sshd" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"${TEST_SSHD_CALLS}"
+debug_printf() {
+  if [[ "${TEST_SSHD_DEBUG_LF_ONLY:-0}" == 1 ]]; then
+    printf '%s\n' "$*" >&2
+  else
+    printf '%s\r\n' "$*" >&2
+  fi
+}
 if [[ "$1" == -T ]]; then
   if [[ " $* " == *" -ddd "* ]]; then
-    printf 'debug2: load_server_config: filename %s\n' "${TEST_SSHD_CONFIG}" >&2
-    while IFS= read -r file; do
-      printf 'debug2: load_server_config: filename %s\n' "${file}" >&2
-    done < <(find -L "${TEST_SSHD_DIR}" -type f | sort)
-    if [[ -n "${TEST_SSHD_EXTRA_CONFIG:-}" ]]; then
-      printf 'debug2: load_server_config: filename %s\n' "${TEST_SSHD_EXTRA_CONFIG}" >&2
+    [[ "${TEST_SSHD_FAIL_DEBUG:-0}" != 1 ]] || exit 1
+    if [[ "${TEST_SSHD_DEBUG_NO_FILES:-0}" != 1 ]]; then
+      debug_printf "debug2: load_server_config: filename ${TEST_SSHD_CONFIG}"
+      while IFS= read -r file; do
+        debug_printf "debug2: load_server_config: filename ${file}"
+      done < <(find -L "${TEST_SSHD_DIR}" -type f | sort)
+      if [[ -n "${TEST_SSHD_EXTRA_CONFIG:-}" ]]; then
+        debug_printf "debug2: load_server_config: filename ${TEST_SSHD_EXTRA_CONFIG}"
+      fi
     fi
+  fi
+  if [[ " $* " != *" -C "* && " $* " != *" -ddd "* &&
+        "${TEST_SSHD_FAIL_EFFECTIVE_DEFAULT:-0}" == 1 ]]; then
+    exit 1
+  fi
+  if [[ " $* " == *" -C "* && "$*" == *"host=example.invalid"* &&
+        "${TEST_SSHD_FAIL_EFFECTIVE_REMOTE:-0}" == 1 ]]; then
+    exit 1
   fi
   printf 'pubkeyauthentication yes\n'
   if [[ -f "${TEST_SSHD_DIR}/00-safe-ssh.conf" &&
@@ -258,55 +276,25 @@ status_output="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_stat
 set -e
 assert_contains "${status_output}" "server: disabled"
 
-# A malformed key is not sufficient to risk disabling password access.
-mkdir -p "${home}/.ssh"
-chmod 700 "${home}/.ssh"
-printf 'ssh-ed25519 garbage\n' >"${home}/.ssh/authorized_keys"
-chmod 600 "${home}/.ssh/authorized_keys"
+# server_on takes no arguments, including the removed --admin-user option.
+reload_calls_before="$(grep -Ec '^reload ' "${TEST_SYSTEMCTL_CALLS}" || true)"
 set +e
 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
   "${script}" server_on --admin-user tester >/dev/null
 status=$?
 set -e
-[[ "${status}" -ne 0 ]] || fail "malformed administrator key was accepted"
-
-# An option-prefixed administrator key may be conditional or restricted, so it
-# is not sufficient evidence that the administrator can safely log in.
-printf 'from="192.0.2.1" ssh-ed25519 AAAA_EXISTING admin\n' >"${home}/.ssh/authorized_keys"
-set +e
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 ]] || fail "conditional administrator key was accepted"
-
-printf 'ssh-ed25519 AAAA_EXISTING admin\n' >"${home}/.ssh/authorized_keys"
-set +e
-TEST_SSHD_NONSTANDARD_AUTH=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "server_on accepted an ineffective standard authorized_keys"
-match_config="${tmp_dir}/match-user.conf"
-printf '%s\n' \
-  'Match User bob' \
-  '    PasswordAuthentication yes' \
-  '    AuthorizedKeysFile .ssh/custom_keys' >"${match_config}"
-set +e
-TEST_SSHD_EXTRA_CONFIG="${match_config}" SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 && ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
-  fail "server_on accepted an unverified conditional SSH context"
+[[ "${status}" == 2 ]] || fail "server_on argument did not return usage error 2"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "argument error created a server drop-in"
+[[ "$(grep -Ec '^reload ' "${TEST_SYSTEMCTL_CALLS}" || true)" == "${reload_calls_before}" ]] ||
+  fail "argument error changed service state"
 
 # An existing unowned drop-in must never be overwritten.
 printf 'PasswordAuthentication yes\n' >"${TEST_SSHD_DIR}/00-safe-ssh.conf"
 unowned_checksum="$(sha256sum "${TEST_SSHD_DIR}/00-safe-ssh.conf")"
 set +e
 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
+  "${script}" server_on </dev/null >/dev/null
 status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "server_on accepted an unowned drop-in"
@@ -314,15 +302,43 @@ set -e
   fail "server_on overwrote an unowned drop-in"
 rm "${TEST_SSHD_DIR}/00-safe-ssh.conf"
 
+# First enable requires exact lowercase y. Every other response, including EOF,
+# cancels without writing configuration or touching the service.
+for response in n yes Y ""; do
+  reload_calls_before="$(grep -Ec '^reload ' "${TEST_SYSTEMCTL_CALLS}" || true)"
+  set +e
+  warning="$(printf '%s\n' "${response}" |
+    SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on 2>&1)"
+  status=$?
+  set -e
+  [[ "${status}" -ne 0 ]] || fail "server_on accepted confirmation '${response}'"
+  [[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+    fail "cancelled server_on wrote a drop-in for '${response}'"
+  [[ "$(grep -Ec '^reload ' "${TEST_SYSTEMCTL_CALLS}" || true)" == "${reload_calls_before}" ]] ||
+    fail "cancelled server_on touched the service for '${response}'"
+done
+reload_calls_before="$(grep -Ec '^reload ' "${TEST_SYSTEMCTL_CALLS}" || true)"
+set +e
+warning="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on </dev/null 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on accepted EOF confirmation"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "EOF-cancelled server_on wrote a drop-in"
+[[ "$(grep -Ec '^reload ' "${TEST_SYSTEMCTL_CALLS}" || true)" == "${reload_calls_before}" ]] ||
+  fail "EOF-cancelled server_on touched the service"
+assert_contains "${warning}" "client public-key-only login test"
+assert_contains "${warning}" "Password and keyboard-interactive authentication will be disabled"
+assert_contains "${warning}" "lock you out"
+
+# Login readiness is the operator's responsibility: server_on neither invokes
+# ssh nor depends on AuthorizedKeysFile or local key files.
 ssh_calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
-[[ "$(wc -l <"${TEST_SSH_CALLS}")" == "$((ssh_calls_before + 1))" ]] ||
-  fail "server_on did not perform exactly one administrator login probe"
-login_probe_call="$(tail -1 "${TEST_SSH_CALLS}")"
-assert_contains "${login_probe_call}" "PreferredAuthentications=publickey"
-assert_contains "${login_probe_call}" "PasswordAuthentication=no"
-assert_contains "${login_probe_call}" "-l tester"
+printf 'y\n' | TEST_SSHD_NONSTANDARD_AUTH=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on >/dev/null
+[[ "$(wc -l <"${TEST_SSH_CALLS}")" == "${ssh_calls_before}" ]] ||
+  fail "server_on invoked ssh"
 assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "# safe_ssh state: enabled"
 assert_file_contains "${TEST_SSHD_DIR}/00-safe-ssh.conf" "PasswordAuthentication no"
 status_output="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_status)"
@@ -337,51 +353,104 @@ assert_contains "${status_output}" "server: disabled"
 enabled_checksum="$(sha256sum "${TEST_SSHD_DIR}/00-safe-ssh.conf")"
 ssh_calls_before="$(wc -l <"${TEST_SSH_CALLS}")"
 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
+  "${script}" server_on </dev/null >/dev/null
 [[ "$(sha256sum "${TEST_SSHD_DIR}/00-safe-ssh.conf")" == "${enabled_checksum}" ]] ||
   fail "idempotent server_on rewrote its drop-in"
 [[ "$(wc -l <"${TEST_SSH_CALLS}")" == "${ssh_calls_before}" ]] ||
-  fail "idempotent server_on repeated the login probe"
+  fail "idempotent server_on invoked ssh"
 grep -Fq -- '-ddd' "${TEST_SSHD_CALLS}" ||
   fail "server policy validation did not inspect conditional SSH contexts"
+TEST_SSHD_DEBUG_LF_ONLY=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on </dev/null >/dev/null
+[[ "$(sha256sum "${TEST_SSHD_DIR}/00-safe-ssh.conf")" == "${enabled_checksum}" ]] ||
+  fail "LF-only Match inspection rewrote the enabled drop-in"
 
 # A failed first enable removes its new drop-in.
 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_off >/dev/null
+reload_calls_before="$(grep -Ec '^reload ' "${TEST_SYSTEMCTL_CALLS}" || true)"
 set +e
-TEST_SSH_LOGIN_PROBE_FAIL=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
-status=$?
-set -e
-[[ "${status}" -ne 0 ]] || fail "server_on accepted a failed administrator login probe"
-[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] || fail "failed server_on left a drop-in"
-set +e
-TEST_SSHD_MATCH_WEAK=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
+failure_output="$(printf 'y\n' |
+  TEST_SSHD_MATCH_WEAK=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+    "${script}" server_on 2>&1)"
 status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "server_on accepted a weak matched context"
+assert_contains "${failure_output}" \
+  "sshd policy mismatch (context=user-local-ipv4, pubkey=yes, password=yes"
 [[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] || fail "weak context left a drop-in"
-
-chmod 777 "${home}/.ssh"
+match_config="${tmp_dir}/match-user.conf"
+printf '%s\n' \
+  'Match User bob' \
+    '    PasswordAuthentication yes' >"${match_config}"
 set +e
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
+failure_output="$(printf 'y\n' |
+  TEST_SSHD_EXTRA_CONFIG="${match_config}" \
+    SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on 2>&1)"
 status=$?
 set -e
-[[ "${status}" -ne 0 ]] || fail "key beneath a writable SSH directory was accepted"
-chmod 755 "${home}/.ssh"
+[[ "${status}" -ne 0 ]] || fail "server_on accepted an unverified conditional SSH context"
+assert_contains "${failure_output}" \
+  "conditional SSH Match directive found: ${match_config}:1:Match User bob"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "conditional SSH context left a drop-in"
+
+set +e
+failure_output="$(printf 'y\n' |
+  TEST_SSHD_FAIL_EFFECTIVE_DEFAULT=1 \
+    SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on ignored default effective-config failure"
+assert_contains "${failure_output}" "cannot evaluate sshd policy (context=default)"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "default effective-config failure left a drop-in"
+
+set +e
+failure_output="$(printf 'y\n' |
+  TEST_SSHD_FAIL_EFFECTIVE_REMOTE=1 \
+    SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on ignored contextual effective-config failure"
+assert_contains "${failure_output}" "cannot evaluate sshd policy (context=user-remote-ipv4)"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "contextual effective-config failure left a drop-in"
+
+set +e
+failure_output="$(printf 'y\n' |
+  TEST_SSHD_FAIL_DEBUG=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+    "${script}" server_on 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on ignored SSH Match inspection failure"
+assert_contains "${failure_output}" "SSH Match inspection failed"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "SSH Match inspection failure left a drop-in"
+
+set +e
+failure_output="$(printf 'y\n' |
+  TEST_SSHD_DEBUG_NO_FILES=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+    "${script}" server_on 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || fail "server_on accepted an empty SSH config inspection"
+assert_contains "${failure_output}" "SSH Match inspection failed"
+[[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] ||
+  fail "empty SSH config inspection left a drop-in"
+[[ "$(grep -Ec '^reload ' "${TEST_SYSTEMCTL_CALLS}" || true)" == "${reload_calls_before}" ]] ||
+  fail "server policy validation failure reloaded SSH"
 
 # Enabling validation and reload failures leave no new drop-in.
 set +e
-TEST_SSHD_FAIL_VALIDATE=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
+printf 'y\n' | TEST_SSHD_FAIL_VALIDATE=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on >/dev/null
 status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "server_on accepted invalid sshd configuration"
 [[ ! -e "${TEST_SSHD_DIR}/00-safe-ssh.conf" ]] || fail "validation failure left a drop-in"
 set +e
-TEST_SYSTEMCTL_FAIL=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
+printf 'y\n' | TEST_SYSTEMCTL_FAIL=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
+  "${script}" server_on >/dev/null
 status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "server_on ignored reload failure"
@@ -402,13 +471,13 @@ status_output="$(SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_stat
 set -e
 assert_contains "${status_output}" "server: legacy"
 set +e
-SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on --admin-user tester >/dev/null
+SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 "${script}" server_on </dev/null >/dev/null
 status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "server_on overwrote a legacy drop-in"
 set +e
 TEST_SSHD_IGNORE_DROPIN=1 SAFE_SSH_TESTING=1 SAFE_SSH_TEST_EUID=0 \
-  "${script}" server_on --admin-user tester >/dev/null
+  "${script}" server_on </dev/null >/dev/null
 status=$?
 set -e
 [[ "${status}" -ne 0 ]] || fail "server_on trusted an ineffective enabled marker"
