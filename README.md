@@ -103,6 +103,41 @@ rclone copy ./photos :sftp:/data/photos \
   --sftp-known-hosts-file ~/.config/safe_ssh/clients/home/known_hosts
 ```
 
+### Windows client
+
+Run `safe_ssh_client.ps1` in PowerShell as the Windows login user, not as
+Administrator. If the OpenSSH client is unavailable, install it from Windows
+Optional Features or run this once in an Administrator PowerShell:
+
+```powershell
+Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+```
+
+Generate or reuse the named key and local SSH alias (this does not connect to
+or modify the server):
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\safe_ssh_client.ps1 `
+  home alice@ssh.example.com -Port 2222
+```
+
+When prompted, press Enter twice to leave the new key's passphrase empty,
+then append the complete public-key line printed by the script as one new line
+to that Linux user's `~/.ssh/authorized_keys` without overwriting its existing
+keys. On the server, set the usual permissions:
+
+```bash
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/authorized_keys
+```
+
+Then use the alias. Verify the server's host-key fingerprint before accepting
+it on the first connection:
+
+```powershell
+ssh home
+```
+
 Every `safe_ssh.sh` invocation writes a complete private log under the
 initiating user's `~/.safe_ssh/logs/`. With `sudo`, that user and home are
 resolved from `SUDO_USER` via the passwd database. Logs contain phases, command
