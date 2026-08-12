@@ -32,6 +32,29 @@ resolve_codex_entrypoint() {
   readlink -f "${codex_path}"
 }
 
+is_native_executable() {
+  local path="$1"
+
+  [[ -f "${path}" && -x "${path}" ]] || return 1
+  file -Lb -- "${path}" 2>/dev/null | grep -q '^ELF '
+}
+
+detect_install_type() {
+  local native_binary="$1"
+
+  case "${native_binary}" in
+    */.codex/packages/standalone/releases/*/bin/codex)
+      printf '%s\n' "standalone"
+      ;;
+    */@openai/codex-linux-*/vendor/*/bin/codex|*/@openai/codex-linux-*/vendor/*/codex/codex)
+      printf '%s\n' "npm"
+      ;;
+    *)
+      printf '%s\n' "native"
+      ;;
+  esac
+}
+
 find_codex_native_binary_under() {
   local roots=("$@")
   local native_path
@@ -52,12 +75,13 @@ resolve_codex_native_binary() {
   local node_dir native_path
   local -a global_roots
 
-  if [[ -x "${entrypoint}" && "$(basename "${entrypoint}")" == "codex" && "${entrypoint}" == */vendor/*/bin/codex ]]; then
-    printf '%s\n' "${entrypoint}"
-    return
-  fi
+  [[ -f "${entrypoint}" ]] || die "Codex entrypoint does not exist: ${entrypoint}"
 
-  if [[ -x "${entrypoint}" && "$(basename "${entrypoint}")" == "codex" && "${entrypoint}" == */vendor/*/codex/codex ]]; then
+  # The official installer exposes the standalone native binary directly.
+  # Prefer any resolved native Codex entrypoint before looking for npm package
+  # layouts, otherwise a stale global npm install can receive the AppArmor
+  # profile instead of the binary that actually runs.
+  if [[ "$(basename "${entrypoint}")" == "codex" ]] && is_native_executable "${entrypoint}"; then
     printf '%s\n' "${entrypoint}"
     return
   fi
@@ -156,20 +180,43 @@ verify_profile_loaded() {
   log "warning: could not confirm ${PROFILE_NAME} in AppArmor profile lists"
 }
 
+show_restart_guidance() {
+  local native_binary="$1"
+  local daemon_state
+
+  if daemon_state="$("${native_binary}" app-server daemon version 2>/dev/null)"; then
+    if grep -Eq '"status"[[:space:]]*:[[:space:]]*"running"' <<<"${daemon_state}"; then
+      log "warning: the Codex app-server daemon is running and was not restarted to avoid interrupting active sessions."
+      log "After all active Codex sessions finish, run:"
+      log "  codex app-server daemon restart"
+      log "Then start a new Codex session to use the updated AppArmor profile."
+      return
+    fi
+
+    log "Start a new Codex session to use the updated AppArmor profile."
+    return
+  fi
+
+  log "Restart all running Codex processes after active work finishes so they inherit the updated AppArmor profile."
+}
+
 main() {
   need_cmd readlink
   need_cmd find
+  need_cmd file
   need_cmd install
   need_cmd mktemp
 
   check_ubuntu_like
 
-  local entrypoint native_binary
+  local entrypoint native_binary install_type
   entrypoint="$(resolve_codex_entrypoint)"
   native_binary="$(resolve_codex_native_binary "${entrypoint}")"
+  install_type="$(detect_install_type "${native_binary}")"
 
   log "Codex entrypoint: ${entrypoint}"
   log "Codex native binary: ${native_binary}"
+  log "Codex install type: ${install_type}"
 
   [[ -x "${native_binary}" ]] || die "Codex native binary is not executable: ${native_binary}"
 
@@ -181,8 +228,11 @@ main() {
 
   verify_profile_loaded
   show_userns_state
+  show_restart_guidance "${native_binary}"
 
-  log "done. Restart Codex so the native process is started under the updated AppArmor profile."
+  log "done."
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
