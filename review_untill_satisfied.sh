@@ -724,9 +724,31 @@ Set satisfied to true exactly when the review finds no remaining issues, and in 
 
 state_initialized=false
 active_invocation_events=""
+active_codex_pid=""
+
+terminate_active_codex() {
+    local pid="$active_codex_pid"
+    local _
+    [ -n "$pid" ] || return 0
+
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for _ in {1..20}; do
+        if ! kill -0 -- "-$pid" 2>/dev/null && ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    if kill -0 -- "-$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null; then
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+    active_codex_pid=""
+}
+
 cleanup() {
     local status=$?
     terminal_tab_spinner_finish "$project_name" || true
+    terminate_active_codex
     if [ "$state_initialized" = true ] && [ "$phase_status" = "running" ]; then
         if [ -n "$active_invocation_events" ]; then
             cleanup_session_id="$(extract_session_id "$active_invocation_events")"
@@ -821,11 +843,34 @@ else
 fi
 state_initialized=true
 
+is_codex_timeout_event() {
+    "$JSON_PYTHON" -c '
+import json
+import sys
+
+try:
+    event = json.loads(sys.argv[1])
+except (json.JSONDecodeError, IndexError):
+    sys.exit(1)
+
+sys.exit(not (
+    isinstance(event, dict)
+    and event.get("type") == "error"
+    and isinstance(event.get("message"), str)
+    and "request timed out" in event["message"]
+))
+' "$1"
+}
+
 run_codex_phase() {
     local prompt="$1"
     local invocation_events="${tmp_dir}/invocation.events.jsonl"
+    local stdout_fifo="${tmp_dir}/codex.stdout.fifo"
+    local codex_pid codex_status line timeout_watchdog_pid=""
     local continue_session=false
+    local timeout_detected=false
     : > "$invocation_events"
+    mkfifo "$stdout_fifo"
     active_invocation_events="$invocation_events"
     if [ -n "$session_id" ] && { [ "$phase_status" = "failed" ] || [ "$phase_status" = "running" ]; }; then
         continue_session=true
@@ -842,46 +887,72 @@ run_codex_phase() {
             (
                 exec 9>&-
                 cd "$project_root"
-                codex exec resume "$session_id" -c "service_tier=\"${service_tier}\"" \
+                exec setsid codex exec resume "$session_id" -c "service_tier=\"${service_tier}\"" \
                     -c 'sandbox_mode="read-only"' \
                     --json --output-schema "$schema_file" --output-last-message "$review_json" "$prompt" \
-                    2>> "$log_file" |
-                    tee -a "$invocation_events" "$events_file" "$log_file" >/dev/null
-                exit "${PIPESTATUS[0]}"
-            )
+                    >"$stdout_fifo" 2>> "$log_file"
+            ) &
         else
             (
                 exec 9>&-
                 cd "$project_root"
-                codex exec resume "$session_id" -c "service_tier=\"${service_tier}\"" \
+                exec setsid codex exec resume "$session_id" -c "service_tier=\"${service_tier}\"" \
                     -c 'sandbox_mode="workspace-write"' \
-                    --json "$prompt" 2>> "$log_file" |
-                    tee -a "$invocation_events" "$events_file" "$log_file" >/dev/null
-                exit "${PIPESTATUS[0]}"
-            )
+                    --json "$prompt" >"$stdout_fifo" 2>> "$log_file"
+            ) &
         fi
     else
         if [ "$phase" = review ]; then
             (
                 exec 9>&-
                 cd "$project_root"
-                codex exec -c "service_tier=\"${service_tier}\"" --json --sandbox read-only \
+                exec setsid codex exec -c "service_tier=\"${service_tier}\"" --json --sandbox read-only \
                     --output-schema "$schema_file" --output-last-message "$review_json" "$prompt" \
-                    2>> "$log_file" |
-                    tee -a "$invocation_events" "$events_file" "$log_file" >/dev/null
-                exit "${PIPESTATUS[0]}"
-            )
+                    >"$stdout_fifo" 2>> "$log_file"
+            ) &
         else
             (
                 exec 9>&-
                 cd "$project_root"
-                codex exec -c "service_tier=\"${service_tier}\"" --json --sandbox workspace-write \
-                    "$prompt" 2>> "$log_file" |
-                    tee -a "$invocation_events" "$events_file" "$log_file" >/dev/null
-                exit "${PIPESTATUS[0]}"
-            )
+                exec setsid codex exec -c "service_tier=\"${service_tier}\"" --json --sandbox workspace-write \
+                    "$prompt" >"$stdout_fifo" 2>> "$log_file"
+            ) &
         fi
     fi
+    codex_pid=$!
+    active_codex_pid="$codex_pid"
+
+    while IFS= read -r line; do
+        printf '%s\n' "$line" >> "$invocation_events"
+        printf '%s\n' "$line" >> "$events_file"
+        printf '%s\n' "$line" >> "$log_file"
+        if [ "$timeout_detected" = false ] && is_codex_timeout_event "$line"; then
+            timeout_detected=true
+            echo "Codex ${phase} phase reported request timed out; terminating invocation." >> "$log_file"
+            kill -TERM -- "-$codex_pid" 2>/dev/null || kill -TERM "$codex_pid" 2>/dev/null || true
+            (
+                for _ in {1..20}; do
+                    if ! kill -0 -- "-$codex_pid" 2>/dev/null; then
+                        exit 0
+                    fi
+                    sleep 0.1
+                done
+                kill -KILL -- "-$codex_pid" 2>/dev/null || kill -KILL "$codex_pid" 2>/dev/null || true
+            ) &
+            timeout_watchdog_pid=$!
+        fi
+    done < "$stdout_fifo"
+    if wait "$codex_pid"; then codex_status=0; else codex_status=$?; fi
+    active_codex_pid=""
+    if [ -n "$timeout_watchdog_pid" ]; then
+        wait "$timeout_watchdog_pid" || true
+    fi
+    rm -f "$stdout_fifo"
+
+    if [ "$timeout_detected" = true ]; then
+        return 124
+    fi
+    return "$codex_status"
 }
 
 while [ "$loop" -le "$max_loops" ]; do
@@ -913,7 +984,11 @@ while [ "$loop" -le "$max_loops" ]; do
                 run_status=resumable
                 write_state
                 echo "Review command failed with exit code ${status}" >> "$log_file"
-                error "Review command failed. See log: ${log_file}"
+                if [ "$status" -eq 124 ]; then
+                    error "Review phase timed out after Codex reported request timed out. The run can be resumed. See log: ${log_file}"
+                else
+                    error "Review command failed. See log: ${log_file}"
+                fi
                 exit "$status"
             fi
             phase_status=completed
@@ -985,7 +1060,11 @@ while [ "$loop" -le "$max_loops" ]; do
             run_status=resumable
             write_state
             echo "Fix command failed with exit code ${status}" >> "$log_file"
-            error "Fix command failed. See log: ${log_file}"
+            if [ "$status" -eq 124 ]; then
+                error "Fix phase timed out after Codex reported request timed out. The run can be resumed. See log: ${log_file}"
+            else
+                error "Fix command failed. See log: ${log_file}"
+            fi
             exit "$status"
         fi
         phase_status=completed

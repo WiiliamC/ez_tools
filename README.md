@@ -243,6 +243,12 @@ The saved service tier is always reused, so `--fast` is not accepted on resume.
 exhausted run requires a larger total before it can continue. Each run is
 locked so only one process can resume it at a time.
 
+If Codex emits a structured stdout error event whose message contains `request
+timed out`, the current review or fix phase is stopped immediately and the
+script exits with status `124`. The failed phase, captured session, and
+worktree checkpoint remain resumable with `--resume`; this avoids waiting for
+Codex's internal reconnect attempts.
+
 ## daily_task.sh
 
 Manages daily cron tasks for the current user.

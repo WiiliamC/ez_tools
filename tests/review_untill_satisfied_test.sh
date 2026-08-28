@@ -22,6 +22,7 @@ export FAKE_CODEX_FIX_PROMPT="${tmp_dir}/fix-prompt"
 export FAKE_CODEX_ARGS_LOG="${tmp_dir}/codex-args.log"
 export FAKE_CODEX_UMASK_LOG="${tmp_dir}/codex-umask.log"
 export FAKE_CODEX_FD9_LOG="${tmp_dir}/codex-fd9.log"
+export FAKE_CODEX_PROCESS_LOG="${tmp_dir}/codex-processes.log"
 
 cat >"${tmp_dir}/bin/codex" <<'EOF'
 #!/usr/bin/env bash
@@ -112,6 +113,31 @@ printf '%s' "${count}" >"${FAKE_CODEX_STATE}"
 session_id="${resume_session:-session-${count}}"
 printf '{"type":"thread.started","thread_id":"%s"}\n' "${session_id}"
 printf '{"type":"item.completed","item":{"type":"agent_message","text":"OpenAI Codex fake session prose on stdout"}}\n'
+
+if [[ "${FAKE_CODEX_HANG_ON_CALL:-}" == "${count}" ]]; then
+  trap '' TERM
+  (
+    trap '' TERM
+    sleep 30
+  ) &
+  printf '%s %s\n' "$$" "$!" >"${FAKE_CODEX_PROCESS_LOG}"
+  wait
+fi
+
+if [[ "${FAKE_CODEX_TIMEOUT_EVENT:-}" == "1" ]] &&
+  { [[ -z "${FAKE_CODEX_TIMEOUT_ON_CALL:-}" ]] || [[ "${FAKE_CODEX_TIMEOUT_ON_CALL}" == "${count}" ]]; }; then
+  if [[ "${FAKE_CODEX_TIMEOUT_FALSE_POSITIVES:-}" == "1" ]]; then
+    printf 'request timed out in stderr only\n' >&2
+    printf '{"type":"error","message":"another failure"}\n'
+    printf '{"type":"item.completed","message":"request timed out"}\n'
+  else
+    printf '{"type":"error","message":"request timed out while contacting service"}\n'
+    # A real Codex retry can remain alive for a long time. The wrapper must
+    # escalate beyond TERM and terminate it promptly after the timeout event.
+    trap '' TERM
+    sleep 30
+  fi
+fi
 
 if [[ "${FAKE_CODEX_FAIL_RESUME:-}" == "1" && -n "${resume_session}" ]] ||
   [[ "${FAKE_CODEX_FAIL_ON_CALL:-}" == "${count}" ]]; then
@@ -600,7 +626,109 @@ reset_fake_codex() {
   unset FAKE_CODEX_FAIL_ON_CALL FAKE_CODEX_FAIL_RESUME FAKE_CODEX_FAIL_STATUS
   unset FAKE_CODEX_HIDE_GIT_ON_FAIL
   unset FAKE_CODEX_REVIEW_RESPONSE
+  unset FAKE_CODEX_TIMEOUT_EVENT FAKE_CODEX_TIMEOUT_FALSE_POSITIVES FAKE_CODEX_TIMEOUT_ON_CALL
+  unset FAKE_CODEX_HANG_ON_CALL
 }
+
+# A structured stdout timeout is terminal for this wrapper, but keeps the
+# captured thread and checkpoint resumable. Similar stderr and unrelated JSON
+# events must not trigger it.
+reset_fake_codex
+timeout_dir="${tmp_dir}/timeout-logs"
+export FAKE_CODEX_TIMEOUT_EVENT=1
+set +e
+timeout_output="$("${script}" --repo "${test_repo}" --max-loops 2 --log-dir "${timeout_dir}" 2>&1)"
+timeout_status=$?
+set -e
+unset FAKE_CODEX_TIMEOUT_EVENT
+timeout_log="$(find "${timeout_dir}" -name '*.log' -print -quit)"
+timeout_state="${timeout_log}.state.json"
+if [[ "${timeout_status}" -ne 124 ]] ||
+  [[ "${timeout_output}" != *"Review phase timed out"* ]] ||
+  [[ "$(json_field "${timeout_state}" phase_status)" != "failed" ]] ||
+  [[ "$(json_field "${timeout_state}" run_status)" != "resumable" ]] ||
+  [[ "$(json_field "${timeout_state}" session_id)" != "session-1" ]] ||
+  ! grep -Fq '"message":"request timed out while contacting service"' "${timeout_log}.events.jsonl"; then
+  printf 'Expected structured timeout to exit 124 with a resumable review. Output:\n%s\n' \
+    "${timeout_output}" >&2
+  exit 1
+fi
+export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"timeout resumed","findings":[]}'
+timeout_resume_output="$("${script}" --resume "${timeout_log}")"
+unset FAKE_CODEX_REVIEW_RESPONSE
+if [[ "${timeout_resume_output}" != *"Review passed on loop 1"* ]] ||
+  ! grep -q '^exec resume session-1 ' "${FAKE_CODEX_ARGS_LOG}"; then
+  printf 'Expected timeout run to resume its captured session. Output:\n%s\n' \
+    "${timeout_resume_output}" >&2
+  exit 1
+fi
+
+reset_fake_codex
+export FAKE_CODEX_TIMEOUT_EVENT=1 FAKE_CODEX_TIMEOUT_FALSE_POSITIVES=1
+export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"not a timeout","findings":[]}'
+false_positive_output="$("${script}" --repo "${test_repo}" --max-loops 1 --log-dir "${tmp_dir}/false-positive-logs" 2>&1)"
+unset FAKE_CODEX_TIMEOUT_EVENT FAKE_CODEX_TIMEOUT_FALSE_POSITIVES FAKE_CODEX_REVIEW_RESPONSE
+if [[ "${false_positive_output}" != *"Review passed on loop 1"* ]] ||
+  [[ "${false_positive_output}" == *"phase timed out"* ]]; then
+  printf 'Expected only structured timeout errors to trigger. Output:\n%s\n' \
+    "${false_positive_output}" >&2
+  exit 1
+fi
+
+reset_fake_codex
+export FAKE_CODEX_TIMEOUT_EVENT=1 FAKE_CODEX_TIMEOUT_ON_CALL=2
+set +e
+fix_timeout_output="$("${script}" --repo "${test_repo}" --max-loops 2 --log-dir "${tmp_dir}/fix-timeout-logs" 2>&1)"
+fix_timeout_status=$?
+set -e
+unset FAKE_CODEX_TIMEOUT_EVENT FAKE_CODEX_TIMEOUT_ON_CALL
+fix_timeout_log="$(find "${tmp_dir}/fix-timeout-logs" -name '*.log' -print -quit)"
+fix_timeout_state="${fix_timeout_log}.state.json"
+if [[ "${fix_timeout_status}" -ne 124 ]] ||
+  [[ "${fix_timeout_output}" != *"Fix phase timed out"* ]] ||
+  [[ "$(json_field "${fix_timeout_state}" phase)" != "fix" ]] ||
+  [[ "$(json_field "${fix_timeout_state}" phase_status)" != "failed" ]] ||
+  [[ "$(json_field "${fix_timeout_state}" run_status)" != "resumable" ]] ||
+  [[ "$(json_field "${fix_timeout_state}" session_id)" != "session-2" ]]; then
+  printf 'Expected structured timeout to exit 124 with a resumable fix. Output:\n%s\n' \
+    "${fix_timeout_output}" >&2
+  exit 1
+fi
+
+# Interrupting the wrapper must terminate and reap the detached Codex process
+# group, including descendants that ignore TERM.
+reset_fake_codex
+interrupt_dir="${tmp_dir}/interrupt-logs"
+export FAKE_CODEX_HANG_ON_CALL=2
+"${script}" --repo "${test_repo}" --max-loops 2 --log-dir "${interrupt_dir}" \
+  >"${tmp_dir}/interrupt-output" 2>&1 &
+wrapper_pid=$!
+for _ in {1..100}; do
+  [[ -s "${FAKE_CODEX_PROCESS_LOG}" ]] && break
+  sleep 0.05
+done
+if [[ ! -s "${FAKE_CODEX_PROCESS_LOG}" ]]; then
+  echo "Expected fake Codex fix process to start" >&2
+  kill -KILL "${wrapper_pid}" 2>/dev/null || true
+  exit 1
+fi
+read -r interrupted_codex_pid interrupted_descendant_pid <"${FAKE_CODEX_PROCESS_LOG}"
+kill -TERM "${wrapper_pid}"
+set +e
+wait "${wrapper_pid}"
+interrupt_status=$?
+set -e
+unset FAKE_CODEX_HANG_ON_CALL
+interrupt_log="$(find "${interrupt_dir}" -name '*.log' -print -quit)"
+if [[ "${interrupt_status}" -ne 143 ]] ||
+  kill -0 "${interrupted_codex_pid}" 2>/dev/null ||
+  kill -0 "${interrupted_descendant_pid}" 2>/dev/null ||
+  [[ "$(json_field "${interrupt_log}.state.json" phase)" != "fix" ]] ||
+  [[ "$(json_field "${interrupt_log}.state.json" phase_status)" != "failed" ]] ||
+  [[ "$(json_field "${interrupt_log}.state.json" run_status)" != "resumable" ]]; then
+  echo "Expected wrapper interruption to terminate the detached Codex group" >&2
+  exit 1
+fi
 
 # A failed review resumes its captured thread and appends to the same durable run.
 reset_fake_codex
