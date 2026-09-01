@@ -2,6 +2,19 @@
 
 A collection of utility tools for Linux systems.
 
+## mp4_to_gif.sh
+
+Converts an MP4 video to a looping GIF with FFmpeg. The frame rate defaults to
+15 FPS, while the source resolution is preserved unless `--resolution` is
+specified. Existing output files are not overwritten unless `--overwrite` is
+used.
+
+```bash
+./mp4_to_gif.sh video.mp4
+./mp4_to_gif.sh --resolution 640x360 --fps 12 video.mp4 preview.gif
+./mp4_to_gif.sh --overwrite video.mp4 existing.gif
+```
+
 ## install_fcitx5_pinyin.sh
 
 Installs Ubuntu/Debian's Fcitx5 packages and configures built-in Pinyin, Baidu
