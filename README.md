@@ -405,11 +405,15 @@ Installs an AppArmor profile for the Codex native binary on Ubuntu/Debian-like s
 
 ```bash
 ./fix_codex_for_ubuntu.sh
+# Optionally restart an already-running app-server daemon after verification:
+./fix_codex_for_ubuntu.sh --restart-daemon
 ```
 
-Useful when Codex fails to start or run commands because unprivileged user namespaces are restricted by AppArmor. The script locates the installed Codex native binary, writes `/etc/apparmor.d/codex-native`, reloads the profile, and prints the current user namespace settings.
+Useful when Codex fails to start or run commands because unprivileged user namespaces are restricted by AppArmor. The script locates the installed Codex native binary, writes `/etc/apparmor.d/codex-native`, validates and reloads the profile, and prints the current user namespace settings.
 
-Requires `sudo` when not run as root. Restart Codex after running the script.
+For Codex releases that use Bubblewrap, the profile grants `userns` to Codex and exact `ix` execution rules for an executable `bwrap` found on `PATH` and/or `codex-resources/bwrap` beside the resolved native binary. It does not install a global Bubblewrap profile or change kernel user-namespace sysctls. The script then checks `codex sandbox -- /usr/bin/true` as the invoking non-root user (using `SUDO_USER` when run through `sudo`); a direct root invocation warns that this check is not meaningful.
+
+Requires `sudo` when not run as root. By default it leaves the app-server daemon running and prints restart guidance. `--restart-daemon` restarts only a daemon already reported as running, and only after sandbox verification succeeds. Run `./fix_codex_for_ubuntu.sh --help` for usage.
 
 ## install_gh_for_ubuntu.sh
 

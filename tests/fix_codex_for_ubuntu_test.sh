@@ -29,6 +29,16 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local haystack="$1"
+  local needle="$2"
+
+  if [[ "${haystack}" == *"${needle}"* ]]; then
+    printf 'Expected output not to contain: %s\nActual output:\n%s\n' "${needle}" "${haystack}" >&2
+    exit 1
+  fi
+}
+
 make_native_binary() {
   local destination="$1"
 
@@ -56,6 +66,51 @@ custom_binary="${tmp_dir}/custom/bin/codex"
 make_native_binary "${custom_binary}"
 assert_equals "${custom_binary}" "$(resolve_codex_native_binary "${custom_binary}")"
 assert_equals "native" "$(detect_install_type "${custom_binary}")"
+
+# Bubblewrap must be permitted only as a Codex descendant.  Cover both the
+# PATH installation and the resource bundled next to the resolved binary.
+bwrap_dir="${tmp_dir}/bwrap-bin"
+system_bwrap="${bwrap_dir}/bwrap"
+bundled_bwrap="$(dirname "$(dirname "${custom_binary}")")/codex-resources/bwrap"
+make_native_binary "${system_bwrap}"
+make_native_binary "${bundled_bwrap}"
+output="$(PATH="${bwrap_dir}:${PATH}" find_codex_bwrap_paths "${custom_binary}")"
+assert_equals "$(readlink -f "${system_bwrap}")
+$(readlink -f "${bundled_bwrap}")" "${output}"
+profile="$(render_profile "${custom_binary}" "$(readlink -f "${system_bwrap}")" "$(readlink -f "${bundled_bwrap}")")"
+assert_contains "${profile}" "$(escape_apparmor_path "$(readlink -f "${system_bwrap}")") ix,"
+assert_contains "${profile}" "$(escape_apparmor_path "$(readlink -f "${bundled_bwrap}")") ix,"
+assert_not_contains "${profile}" "profile bwrap"
+
+# Paths are quoted for whitespace and every AppArmor AARE metacharacter is
+# escaped so an exact executable rule cannot turn into a glob.
+special_path="${tmp_dir}/App Armor/a*b?c[d]e{f,g}h^i\"j\\k/codex"
+escaped_special_path="\"${tmp_dir}/App Armor/a\\*b\\?c\\[d\\]e\\{f,g\\}h\\^i\\\"j\\\\k/codex\""
+assert_equals "${escaped_special_path}" "$(escape_apparmor_path "${special_path}")"
+special_profile="${tmp_dir}/special-profile"
+render_profile "${special_path}" "${special_path}-bwrap" >"${special_profile}"
+validate_profile "${special_profile}"
+
+rm -f "${bundled_bwrap}"
+ln -s "${system_bwrap}" "${bundled_bwrap}"
+output="$(PATH="${bwrap_dir}:${PATH}" find_codex_bwrap_paths "${custom_binary}")"
+assert_equals "$(readlink -f "${system_bwrap}")" "${output}"
+
+# The public argument parser accepts only the explicit daemon restart switch.
+restart_daemon=false
+parse_args --restart-daemon
+assert_equals "true" "${restart_daemon}"
+set +e
+output="$(parse_args --not-an-option 2>&1)"
+status=$?
+set -e
+if [[ "${status}" -eq 0 ]]; then
+  echo "Expected an unknown option to fail" >&2
+  exit 1
+fi
+assert_contains "${output}" "unknown option"
+output="$(bash "${repo_root}/fix_codex_for_ubuntu.sh" --help)"
+assert_contains "${output}" "Usage: fix_codex_for_ubuntu.sh"
 
 # A directly invoked standalone binary must win even when an npm installation
 # also exists elsewhere on the machine.
@@ -106,6 +161,28 @@ if [[ "${output}" == *"daemon restart"* ]]; then
   exit 1
 fi
 
+restartable_daemon_cli="${tmp_dir}/restartable-daemon-codex"
+cat >"${restartable_daemon_cli}" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == "app-server daemon version" ]]; then
+  printf '%s\n' '{"status":"running"}'
+elif [[ "$*" == "app-server daemon restart" ]]; then
+  printf '%s\n' restarted >"${CODEX_TEST_DAEMON_LOG}"
+else
+  exit 99
+fi
+EOF
+chmod +x "${restartable_daemon_cli}"
+daemon_log="${tmp_dir}/daemon.log"
+CODEX_TEST_DAEMON_LOG="${daemon_log}" restart_running_daemon "${restartable_daemon_cli}"
+assert_equals "restarted" "$(<"${daemon_log}")"
+rm -f "${daemon_log}"
+restart_running_daemon "${stopped_daemon_cli}"
+if [[ -e "${daemon_log}" ]]; then
+  echo "Stopped daemon must not be restarted" >&2
+  exit 1
+fi
+
 unsupported_cli="${tmp_dir}/unsupported-codex"
 cat >"${unsupported_cli}" <<'EOF'
 #!/usr/bin/env bash
@@ -114,3 +191,38 @@ EOF
 chmod +x "${unsupported_cli}"
 output="$(show_restart_guidance "${unsupported_cli}")"
 assert_contains "${output}" "Restart all running Codex processes after active work finishes"
+
+# Root runs must use the original sudo user for local sandbox verification;
+# without one, verification must be skipped with an actionable warning.
+verification_cli="${tmp_dir}/verification-codex"
+cat >"${verification_cli}" <<'EOF'
+#!/usr/bin/env bash
+[[ "$*" == "sandbox -- /usr/bin/true" ]]
+EOF
+chmod +x "${verification_cli}"
+assert_equals "exampleuser" "$(verification_user_for_euid 0 exampleuser)"
+set +e
+output="$(verification_user_for_euid 0 '' 2>&1)"
+status=$?
+set -e
+if [[ "${status}" -eq 0 ]]; then
+  echo "Expected root without SUDO_USER to have no verification user" >&2
+  exit 1
+fi
+failing_verification_cli="${tmp_dir}/failing-verification-codex"
+printf '#!/usr/bin/env bash\nexit 1\n' >"${failing_verification_cli}"
+chmod +x "${failing_verification_cli}"
+set +e
+output="$(verify_sandbox "${failing_verification_cli}" 2>&1)"
+status=$?
+set -e
+if verification_user_for_euid "${EUID}" "${SUDO_USER:-}" >/dev/null; then
+  if [[ "${status}" -eq 0 ]]; then
+    echo "Expected sandbox verification failure to fail" >&2
+    exit 1
+  fi
+  assert_contains "${output}" "local sandbox verification failed"
+else
+  assert_equals "0" "${status}"
+  assert_contains "${output}" "cannot perform meaningful non-root sandbox verification"
+fi
