@@ -17,8 +17,10 @@ used.
 
 ## install_fcitx5_pinyin.sh
 
-Installs Ubuntu/Debian's Fcitx5 packages and configures built-in Pinyin, Baidu
-cloud candidates (second candidate), prediction, and the Material black theme.
+Installs Ubuntu/Debian's Fcitx5, Rime and Lua support, downloads
+[Rime Ice (雾凇拼音)](https://github.com/iDvel/rime-ice), and sets full Pinyin as
+the default with the Material black theme. Existing input methods, including
+built-in Pinyin, remain available as fallbacks.
 Run it as the logged-in desktop user, not through `sudo`:
 
 ```bash
@@ -28,8 +30,23 @@ Run it as the logged-in desktop user, not through `sudo`:
 fcitx5-config-qt                    # optional GUI configuration
 ```
 
-Log out and back in after installation. Cloud Pinyin sends lookup queries to
-Baidu; use the Fcitx5 GUI or remove the cloud settings if that is unsuitable.
+Log out and back in after installation. Rime Ice input is offline; existing
+built-in Pinyin cloud settings are preserved and still apply when using that
+fallback. The script no longer enables Baidu cloud candidates.
+
+Run `install` again to download the current upstream revision and update the
+resources. Rime data lives in `${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5/rime`.
+Custom patches, custom phrases and learned dictionaries are retained. Changed
+files receive adjacent `.bak.<timestamp>` backups; identical files are left
+alone. To restore a file, exit Fcitx5, copy its backup over the original, then
+start Fcitx5 and redeploy Rime. Rime directories containing symlinks are rejected
+to avoid overwriting linked files.
+
+Downloads and dictionary compilation happen in a temporary directory before
+publishing resources or changing the default input method. A download or
+deployment failure leaves the existing input configuration intact (APT packages
+may already have been installed). `status` reports the upstream revision and
+required build files, but does not verify the active desktop session.
 
 ## safe_ssh.sh
 
