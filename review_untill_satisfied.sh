@@ -8,7 +8,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=terminal_tab_spinner.sh
 source "${script_dir}/terminal_tab_spinner.sh"
 
-DEFAULT_MAX_LOOPS=5
+DEFAULT_MAX_LOOPS=12
 exec_datetime="$(date '+%Y%m%d_%H%M%S')"
 
 usage() {
