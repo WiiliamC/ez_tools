@@ -365,7 +365,7 @@ Forwarding is closed when you run `remove <local_port>` for that port, run `flus
 
 ## check_port.sh
 
-Checks whether a TCP port is currently occupied by a listening process.
+Checks whether a TCP port has a listener in the current network namespace.
 
 ```bash
 ./check_port.sh <port>
@@ -377,7 +377,9 @@ Example:
 ./check_port.sh 8080
 ```
 
-The script validates that the port is between `1` and `65535`, then reports whether it is available or in use. It uses `lsof`, `ss`, or `netstat`, depending on which command is available on the system.
+The script validates that the port is between `1` and `65535`, then reports whether a TCP listener exists. It prefers `ss`, falling back to `netstat` if needed. Process details from `lsof` are optional: missing permissions to inspect another user's process do not imply that the port has no listener. If only `lsof` can run, a visible listener confirms listening, but an empty result leaves the state unknown.
+
+Exit codes are `0` for a determined listening or non-listening state, `1` for invalid arguments, and `2` when the state cannot be determined (including missing tools or failed queries). Query failures produce diagnostics on standard error. This checks IPv4 and IPv6 TCP listeners only; it does not test UDP, other network namespaces, or guarantee that an application can bind the port.
 
 ## csv_view.sh
 
