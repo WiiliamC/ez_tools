@@ -279,9 +279,41 @@ script exits with status `124`. The failed phase, captured session, and
 worktree checkpoint remain resumable with `--resume`; this avoids waiting for
 Codex's internal reconnect attempts.
 
+## repeat_task.sh
+
+Runs a command at a fixed interval using persistent entries in the current user's crontab.
+
+```bash
+./repeat_task.sh add <task_name> <interval> <command> [args...]
+./repeat_task.sh list
+./repeat_task.sh delete <task_name>
+./repeat_task.sh -h
+```
+
+For example, run a report every hour:
+
+```bash
+./repeat_task.sh add report 1h /usr/bin/python3 /opt/tasks/report.py
+./repeat_task.sh add shell_job 90m bash -lc 'date >> ~/repeat.txt'
+./repeat_task.sh list
+./repeat_task.sh delete report
+```
+
+Intervals are positive integers with a unit: `m` for minutes, `h` for hours, or `d` for 24-hour days. Examples include `1m`, `90m`, `7h`, and `2d`. The minimum interval is one minute; fractional, zero, negative, unitless, and overflowing values are rejected. The maximum normalized interval is 9223372036854775807 minutes.
+
+The schedule is anchored to the minute when the task is added. Adding `1h` at 10:23:45 schedules the first run at 11:23 and subsequent runs at 12:23, 13:23, and so on. Each minute, cron invokes a standalone wrapper that checks the saved anchor and interval; arbitrary intervals continue across hour and day boundaries. Wall-clock adjustments affect the schedule.
+
+Tasks continue after logout and reboot, provided cron is installed, running, and enabled at boot, and the task files, working directory, and executables remain accessible without an interactive login. The script does not install or configure the system cron service. No repository checkout or original terminal session is needed to execute registered tasks. Missed runs during downtime are skipped; after reboot, the task waits for its next scheduled minute instead of catching up.
+
+Commands retain their argument boundaries and run from the add-time working directory. Use an explicit shell such as `bash -lc` for pipes or redirections, and absolute executable paths when programs are not on cron's `PATH`. The cron environment applies; the adding shell's environment is not saved.
+
+The wrapper appends start records, command stdout/stderr, and exit status to `~/.repeat_task/logs/{task}/{YYYY-MM-DD}.log`, with wrapper-owned records prefixed by `[repeat_task]`. A per-task `flock` prevents overlapping executions: a still-running task causes the next due run to be skipped with exit status 75, without queueing. Failures do not cancel future runs. Different tasks can run concurrently.
+
+Task names may contain only letters, digits, underscore, dot, and hyphen, and cannot be `.` or `..`. Duplicate names are rejected. `list` shows each task's interval, wrapper status, and command. `delete` removes its managed cron entry and wrapper, preserves logs, and allows any running command to finish. Management operations are serialized across both task scripts and preserve unrelated crontab entries.
+
 ## daily_task.sh
 
-Manages daily cron tasks for the current user.
+Manages daily cron tasks for the current user. This compatibility entrypoint calls `repeat_task.sh --daily`, sharing task management, wrapper generation, logging, and locking. Keep both scripts in the same directory when installing them.
 
 ```bash
 ./daily_task.sh add <task_name> <HH:MM> <command> [args...]
@@ -301,7 +333,9 @@ Examples:
 
 Task names may contain only letters, digits, underscore, dot, and hyphen. Times use 24-hour `HH:MM` format from `00:00` through `23:59`. Commands are stored as argument arrays, so shell syntax is interpreted only when you explicitly run a shell such as `bash -lc '...'`. Tasks run from the add-time working directory, so relative command paths and relative arguments are resolved from that directory at run time.
 
-The script tags its crontab entries with clear markers and only modifies those managed entries. Logs are appended under `~/.daily_task/logs/{task}/{YYYY-MM-DD}.log`.
+The script tags its crontab entries with clear markers and only modifies those managed entries. Logs are appended under `~/.daily_task/logs/{task}/{YYYY-MM-DD}.log`. Existing daily tasks, wrappers, and logs remain compatible without migration. Daily and interval tasks have separate namespaces, so the same task name can exist in both; each script lists and deletes only its own tasks.
+
+Daily execution follows cron's timezone and requires cron to be running and enabled at boot, with task files and commands accessible after reboot. As with interval tasks, overlapping runs are skipped, failures do not cancel scheduling, and deletion preserves logs and lets an active command finish.
 
 ## port_forward.sh
 
