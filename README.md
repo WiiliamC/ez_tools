@@ -2,6 +2,40 @@
 
 A collection of utility tools for Linux systems.
 
+## install_nvidia_container_toolkit.sh
+
+Installs NVIDIA Container Toolkit from NVIDIA's stable APT repository on
+Ubuntu/Debian and configures system Docker using `nvidia-ctk`. Requires Docker
+and a working NVIDIA GPU driver to be installed beforehand. Rootless Docker
+and other container engines are not supported. Uses root or `sudo` as needed.
+Installation follows the [NVIDIA installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+
+```bash
+./install_nvidia_container_toolkit.sh                      # install and restart Docker
+./install_nvidia_container_toolkit.sh install --no-restart  # defer restart
+./install_nvidia_container_toolkit.sh status
+./install_nvidia_container_toolkit.sh help
+```
+
+The default Docker restart may interrupt running containers. With `--no-restart`,
+run `sudo systemctl restart docker` when ready. Existing `daemon.json` is backed
+up beside the original as `.bak.<timestamp>` before configuration; recovery
+instructions are printed. Configuration and restart failures return nonzero;
+installed packages and repository changes are not automatically rolled back.
+Repeating installation updates packages to the current APT candidates and
+replaces the dedicated repository file without appending duplicate entries.
+
+`status` queries the local system Docker socket, ignoring remote contexts. Socket
+permission errors are reported; use `sudo ./install_nvidia_container_toolkit.sh status`
+if needed. Runtime registration does not prove GPU access. After restarting,
+verify manually (this downloads an image if needed):
+
+```bash
+sudo docker --host unix:///var/run/docker.sock run --rm --runtime=nvidia --gpus all ubuntu:24.04 nvidia-smi
+```
+
+Run isolated tests with `bash tests/install_nvidia_container_toolkit_test.sh`.
+
 ## mp4_to_gif.sh
 
 Converts an MP4 video to a looping GIF with FFmpeg. The frame rate defaults to
