@@ -4,8 +4,9 @@ A collection of utility tools for Linux systems.
 
 ## rsync_backup.sh
 
-Backs up the contents of local directory A into B using rsync. New files are
-copied and changed files are updated; files deleted from A remain in B.
+Backs up the contents of local directory A into B using rclone. The script name
+is retained for compatibility. New files are copied and changed files are
+updated; files deleted from A remain in B.
 Unchanged files are skipped by comparing size and modification time. Use
 `--checksum` to compare contents instead, which requires reading both copies.
 Updated files replace the previous version; this does not keep version history.
@@ -18,25 +19,36 @@ Updated files replace the previous version; this does not keep version history.
 ./rsync_backup.sh --checksum ./source ./backup
 ```
 
-Runs up to **8 concurrent rsync transfers** by default. Override with `-j N`,
-`--jobs N`, or `--jobs=N` (a positive integer without leading zeros). Files are
-distributed across disjoint lists; a single file is never split. Fewer files
-may use fewer tasks. Directories are prepared before transfers and their
-attributes restored afterward. Failed transfers return nonzero; interruption
-stops outstanding tasks and removes temporary lists. Completed copies remain.
-The temporary directory (`TMPDIR`, or `/tmp` by default) must be outside both
-backup trees so temporary lists cannot be included in the backup.
+Runs one `rclone copy` process with up to **8 concurrent file transfers**.
+Override with `-j N`, `--jobs N`, or `--jobs=N` (a positive integer without
+leading zeros), mapped to rclone's `--transfers`. Single-file threading uses
+rclone defaults. Failed transfers return rclone's nonzero status; signals go
+directly to rclone. Completed copies remain after interruption.
 
-B and its missing parent directories are created automatically. `--dry-run`
-uses one complete preview regardless of the concurrency setting, without
-writing files or creating directories. A's contents go directly
-into B, regardless of trailing slashes. Hidden files and subdirectories are
-included; symlinks are copied as links. Identical or nested source/destination
-paths are rejected after resolving symlinks. Only local paths (including
-mounted storage) are supported. Requires rsync 3.2.3+, GNU `realpath`/`find`,
-and util-linux `setsid`. No GNU Parallel installation is needed.
+Progress is enabled automatically: when stderr is a terminal, live statistics
+show transferred bytes, percentage, speed and estimated remaining time. When
+redirected, a single-line summary is logged to stderr every 10 seconds and at
+completion. Totals may change as rclone discovers files. `--dry-run` prints a
+preview without transfer statistics, writing files or creating directories.
 
-Run isolated tests with `bash tests/rsync_backup_test.sh`.
+B and its missing parent directories are created automatically. A's contents
+go directly into B, regardless of trailing slashes. Hidden files, subdirectories
+and empty directories are included. `--links` preserves symlinks rather than
+following their targets; rclone reserves the `.rclonelink` suffix for its link
+translation, so ordinary files with that suffix are not handled as ordinary
+files. `--metadata` preserves supported file attributes, including permissions
+and modification times, subject to filesystem support and user privileges.
+This is not full `rsync -a` compatibility: directory attributes, special files
+and attribute-only updates follow rclone behavior, without permission repair.
+See [rclone's local backend documentation](https://rclone.org/local/) for details.
+
+Identical or nested source/destination paths are rejected after resolving
+symlinks. Destination symlinks conflicting with source directories are rejected
+before copying. Only local paths (including mounted storage) are supported. Requires
+rclone with `--metadata` support (verified with 1.60.1) and GNU `realpath`/`find`.
+No rsync, worker processes or temporary file lists are needed.
+
+Run isolated tests with `bash tests/rsync_backup_test.sh` (also requires Python 3).
 
 ## install_nvidia_container_toolkit.sh
 
