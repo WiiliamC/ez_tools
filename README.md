@@ -2,6 +2,66 @@
 
 A collection of utility tools for Linux systems.
 
+## commit_by_codex.sh
+
+Generates a commit message with Codex, then commits only after you explicitly
+enter `y`. Includes all tracked changes, deletions, and non-ignored new files,
+even when files are only partially staged. Defaults to the current directory's
+Git repository and `gpt-5.3-codex-spark`.
+
+```bash
+./commit_by_codex.sh
+./commit_by_codex.sh --repo ./example-project
+./commit_by_codex.sh --model gpt-5.3-codex-spark
+```
+
+Requires Bash, Git with `--path-format` support, Python 3, an authenticated Codex
+CLI supporting `exec --json --ephemeral --sandbox read-only`, and an interactive
+terminal. The selected model must be available to your account; failures do not
+silently select another model. Use `--help` for options.
+
+Codex runs read-only and receives the candidate diff. It is instructed to read
+applicable project `AGENTS.md` / `AGENTS.override.md` files, follow their commit
+and privacy requirements, and otherwise match recent commit language and style.
+It must report blocked if required checks cannot be completed, sensitive data
+is found, or the changes cannot be fully analyzed. Binary changes are described
+from metadata. The script does not run a separate test or review loop.
+
+The confirmation displays the file list, change statistics, and full message.
+Only lowercase `y` commits; any other answer, an empty answer, or EOF cancels.
+There are no editing, regeneration, or automatic-confirmation options. The
+message stays in a Bash variable and is passed to `git commit -F -` on stdin;
+no temporary message file is created by the script. Git itself still manages
+its normal commit-message files. Codex events are parsed in memory, and the
+script requests an ephemeral session instead of persisting a session log.
+
+A private directory under `/tmp` holds alternate Git indexes. These construct
+an immutable candidate tree without replacing your staging area. The script
+checks branch, HEAD, index bytes, and candidate tree before showing the message
+and after confirmation. Changes cause an exit and require a fresh run; a mere
+file timestamp change does not. Git clean filters and attributes apply when
+building trees, and candidate blobs may remain as unreachable Git objects until
+Git garbage collection. Temporary indexes are removed on normal exit or handled
+interruption.
+
+The actual commit uses the confirmed index snapshot. Later working-tree edits
+remain uncommitted. Normal Git hooks and signing still run and can change the
+message or candidate content; a failing hook is not bypassed. The real index is
+locked during commit and synchronized to the resulting commit on success. If it
+was changed despite the lock, the commit is reported successful but index
+synchronization is skipped. Cancellation or commit failure preserves the real
+index and does not undo changes made by other processes or hooks.
+
+Resolve active merge, rebase, cherry-pick, revert, bisect, or conflict states
+first. Sparse checkouts, assume-unchanged/skip-worktree entries, and changed submodules
+are not supported. Do not run
+with Git repository/index override environment variables. Avoid concurrent
+branch/HEAD changes during the final Git commit; consistency checks do not lock
+all repository operations.
+
+Run isolated tests with `bash tests/commit_by_codex_test.sh`. Tests use temporary
+repositories, a pseudo-terminal, and a mock Codex without calling a real model.
+
 ## rsync_backup.sh
 
 Backs up the contents of local directory A into B using rclone. The script name
