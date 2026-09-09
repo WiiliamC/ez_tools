@@ -256,6 +256,36 @@ print(json.dumps({"type": "turn.completed"}))
     code, output = run(repo)
     assert code != 0 and 'active Git operation' in output, output
 
+    for mode in ('success', 'fail', 'malformed', 'empty', 'blocked', 'worktree', 'hook-failure', 'no-changes'):
+        repo = setup('auto-' + mode)
+        if mode == 'hook-failure':
+            hook = repo / '.git/hooks/pre-commit'
+            hook.write_text('#!/bin/sh\nexit 1\n')
+            hook.chmod(0o755)
+        if mode == 'no-changes':
+            git(repo, 'add', '.')
+            git(repo, 'commit', '-qm', 'All changes')
+        before = index_bytes(repo)
+        head = git(repo, 'rev-parse', 'HEAD')
+        before_tmp = set(Path('/tmp').glob('commit-by-codex.*'))
+        result = subprocess.run(
+            ['bash', script, '--repo', str(repo), '-y', '--model', 'example-model'],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=20,
+            env=dict(env, EXPECTED_MODEL='example-model',
+                     MOCK_MODE='success' if mode in ('hook-failure', 'no-changes') else mode))
+        assert b'Commit these changes?' not in result.stdout
+        assert set(Path('/tmp').glob('commit-by-codex.*')) <= before_tmp
+        assert not (repo / '.git/index.lock').exists()
+        if mode == 'success':
+            assert result.returncode == 0, result.stderr
+            assert git(repo, 'log', '-1', '--format=%B').decode().rstrip('\n') == message
+            assert git(repo, 'status', '--porcelain') == b''
+            assert b'Files to commit:' in result.stdout and b'Commit message:' in result.stdout
+        else:
+            assert (result.returncode == 0) == (mode == 'no-changes'), result.stderr
+            assert git(repo, 'rev-parse', 'HEAD') == head
+            assert index_bytes(repo) == before
+
     result = subprocess.run(['bash', script, '--repo', str(repo)], env=env, capture_output=True)
     assert result.returncode != 0 and b'interactive terminal' in result.stderr
     result = subprocess.run(['bash', script, '--help'], env=env, capture_output=True)

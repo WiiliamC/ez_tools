@@ -4,28 +4,33 @@ umask 077
 
 usage() {
     cat <<'HELP'
-Usage: commit_by_codex.sh [--repo PATH] [--model MODEL]
+Usage: commit_by_codex.sh [--repo PATH] [--model MODEL] [-y]
 
 Generate a commit message with read-only Codex, then ask before committing all
 tracked changes and non-ignored new files. Requires Bash, Git, Python 3, Codex,
-and an interactive terminal. Default model: gpt-5.3-codex-spark.
+and an interactive terminal unless -y is supplied. Default model: gpt-5.3-codex-spark.
+
+  -y    Skip confirmation and commit without requiring an interactive terminal.
+        Git hooks and signing retain their normal behavior.
 HELP
 }
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 repo=.
 model=gpt-5.3-codex-spark
+auto_confirm=false
 while (($#)); do
     case "$1" in
         --repo|--model)
             (($# >= 2)) && [[ -n "$2" ]] || fail "$1 requires a value"
             if [[ "$1" == --repo ]]; then repo=$2; else model=$2; fi
             shift 2 ;;
+        -y) auto_confirm=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) fail "Unknown option: $1" ;;
     esac
 done
 for command in git python3 codex; do command -v "$command" >/dev/null || fail "Missing dependency: $command"; done
-[[ -t 0 && -t 1 ]] || fail 'An interactive terminal is required.'
+[[ "$auto_confirm" == true || ( -t 0 && -t 1 ) ]] || fail 'An interactive terminal is required.'
 # Do not accidentally inherit another tool's alternate repository/index.
 for name in GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES; do
     [[ ! -v "$name" ]] || fail "Unset $name before running this script."
@@ -186,11 +191,14 @@ check_consistency
 printf '\nFiles to commit:\n'
 git -c color.ui=false -c core.quotePath=true diff --no-ext-diff --no-textconv --name-status "$base_tree" "$approved_tree" --
 git -c color.ui=false -c core.quotePath=true diff --no-ext-diff --no-textconv --stat "$base_tree" "$approved_tree" --
-printf '\nCommit message:\n%s\n\nCommit these changes? [y/N] ' "$commit_message"
-answer=
-if ! IFS= read -r answer || [[ "$answer" != y ]]; then
-    printf 'Cancelled.\n'
-    exit 0
+printf '\nCommit message:\n%s\n\n' "$commit_message"
+if [[ "$auto_confirm" != true ]]; then
+    printf 'Commit these changes? [y/N] '
+    answer=
+    if ! IFS= read -r answer || [[ "$answer" != y ]]; then
+        printf 'Cancelled.\n'
+        exit 0
+    fi
 fi
 check_consistency
 # Reserve the real index until commit/sync finishes. Codex and Git commit use
