@@ -24,6 +24,10 @@ silently select another model. Use `--help` for options.
 Codex runs read-only and receives the candidate diff. It is instructed to read
 applicable project `AGENTS.md` / `AGENTS.override.md` files, follow their commit
 and privacy requirements, and otherwise match recent commit language and style.
+The prompt requests a concise title using the supplied diff and three recent
+subjects, with a body only when needed. It limits extra reads to applicable
+instructions and skips code review and tests/lint/builds unless project rules
+require them.
 It must report blocked if required checks cannot be completed, sensitive data
 is found, or the changes cannot be fully analyzed. Binary changes are described
 from metadata. The script does not run a separate test or review loop.
