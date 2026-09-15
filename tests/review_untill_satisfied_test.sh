@@ -87,12 +87,15 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 if [[ -n "${output_schema}" ]]; then
-  python3 - "${output_schema}" <<'PY'
+  # Validate the actual review input on every invocation, including exec resume.
+  python3 - "${output_schema}" "${prompt:-}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 schema = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+prompt = sys.argv[2]
+assert set(schema["properties"]) == {"satisfied", "summary", "findings"}
 items = schema["properties"]["findings"]["items"]
 assert items == {
     "type": "object",
@@ -100,6 +103,29 @@ assert items == {
     "properties": {"issue": {"type": "string"}},
     "required": ["issue"],
 }
+for required in (
+    "staged and unstaged diffs, and relevant untracked files",
+    "do not flag pre-existing bugs",
+    "provably affected",
+    "level of rigor absent from the rest of the codebase",
+    "not just an intentional behavior change",
+    "Return all qualifying findings",
+    "deduplicate findings",
+    "smallest supporting line range",
+    "Priority meanings:",
+    "Do not modify files or generate a PR fix",
+    "Any qualifying P0-P3 finding makes satisfied false",
+    "do not add separate fields",
+):
+    assert required in prompt, f"Review invocation lost required guidance: {required}"
+# The embedded JSON example must describe the same protocol as --output-schema.
+example = prompt[prompt.index("{\n"):prompt.index("\n}") + 2]
+example = example.replace("boolean", "true").replace("string", '"example"')
+example = json.loads(example)
+assert set(example) == set(schema["properties"])
+assert set(example["findings"][0]) == {"issue"}
+for official_field in ("overall_correctness", "confidence_score", "code_location"):
+    assert official_field not in prompt, f"Conflicting official output field: {official_field}"
 PY
 fi
 

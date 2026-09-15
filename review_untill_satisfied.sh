@@ -707,7 +707,52 @@ JSON
 # files that Codex (or commands it launches) creates in the target repository.
 umask "$caller_umask"
 
-review_prompt='Review the current uncommitted changes in this repository. Inspect git status, staged and unstaged diffs, and relevant untracked files before deciding.
+# Adapted from OpenAI Codex review guidelines; synced 2026-09-15.
+# https://github.com/openai/codex/blob/a8964cb1bad67bc26a826fb07d1bef99c6a3f008/codex-rs/prompts/templates/review/rubric.md
+# Keep review criteria aligned with this pinned source. Output instructions are
+# adapted to our existing satisfied/summary/findings[].issue protocol.
+review_prompt="$(cat <<'PROMPT'
+Review the current uncommitted changes in this repository. Inspect git status, staged and unstaged diffs, and relevant untracked files before deciding.
+
+# Review guidelines
+
+You are acting as a reviewer for a proposed code change made by another engineer. Use the following default guidelines to identify issues the original author would want to fix. More-specific applicable developer, user, and project instructions take precedence over these general review guidelines.
+
+Only flag a bug when all of these criteria hold:
+1. It meaningfully impacts the accuracy, performance, security, or maintainability of the code.
+2. It is discrete and actionable, rather than a general concern or a combination of unrelated issues.
+3. Fixing it does not demand a level of rigor absent from the rest of the codebase. For example, do not demand exhaustive validation or documentation for a repository of one-off scripts.
+4. It was introduced by the current uncommitted changes; do not flag pre-existing bugs.
+5. The original author would likely fix it if made aware of it.
+6. It does not rely on unstated assumptions about the codebase or the author's intent.
+7. Its impact is supported by evidence. Speculation that another component might break is insufficient: identify the code that is provably affected.
+8. It is clearly not just an intentional behavior change.
+
+Return all qualifying findings, not just the first. Prefer no findings when none clearly warrant a fix. Ignore trivial style unless it obscures meaning or violates documented standards, and apply the bug criteria above even in those cases. Do not raise non-blocking formatting, typo, or documentation nits.
+
+# Repository rule attribution
+
+Use the root and scoped project instruction files applicable to changed files, respecting project-document precedence (AGENTS.override.md, AGENTS.md, then configured fallback filenames). Accept guidance in prose, headings, checklists, bullets, or tables without requiring formal rule IDs. More-specific guidance wins on conflict, and user instructions about review scope or style take precedence.
+
+Review the diff independently and deduplicate findings by changed location and defect/remedy. A finding is rule-supported only when applicable guidance materially contributes repository-specific scope, an invariant, remedy, convention, or confirmation behavior beyond generic correctness advice. Preserve and combine rule support when merging duplicate candidates, then check each final candidate against applicable rules. Do not omit ordinary findings or invent findings merely because a rule file exists.
+
+For every rule-supported finding, verify the applicable instruction file and its smallest supporting line range, then include one compact Markdown or local-file reference in the issue string. Do not fabricate citations or add hidden metadata or output fields.
+
+# Finding descriptions and priorities
+
+Use one finding per distinct issue, sorted by priority from P0 to P3. Start each issue string with a priority tag and a short, imperative title (at most 80 characters), followed by the changed file path and a precise line range, then a concise explanation. The location must overlap the diff (or identify lines in a relevant new untracked file). Use the smallest useful range, avoiding ranges longer than 5-10 lines.
+
+Priority meanings:
+- [P0]: Drop everything to fix; blocks release, operations, or major usage universally, without assumptions about inputs.
+- [P1]: Urgent; address in the next cycle.
+- [P2]: Normal; fix eventually.
+- [P3]: Low; nice to have, but still must meet the qualifying bug criteria.
+
+Explain why the issue is a bug and identify the scenarios, environments, or inputs needed to trigger it. Make any dependence of severity on those conditions clear immediately. Do not exaggerate severity. Keep the explanation to one paragraph, clear enough to understand on first reading. Use a factual, helpful tone without accusations or excessive praise. If code is necessary to explain a finding, use Markdown inline code or a code block of at most three lines.
+
+This is a review-only phase. Do not modify files or generate a PR fix.
+
+# Output format
 
 Return a structured final JSON message that matches the provided output schema:
 {
@@ -720,7 +765,9 @@ Return a structured final JSON message that matches the provided output schema:
   ]
 }
 
-Set satisfied to true exactly when the review finds no remaining issues, and in that case return an empty findings array. When unsatisfied, include one or more concise, actionable findings, each as an object with only an issue string.'
+Set satisfied to true exactly when there are no qualifying findings under the review guidelines above, and in that case return an empty findings array. Any qualifying P0-P3 finding makes satisfied false. When unsatisfied, include one or more findings, each as an object with only an issue string. Put the priority, location, explanation, and any rule reference inside that string; do not add separate fields for them. Use summary for a brief explanation of the review result. Do not wrap the JSON in Markdown fences or extra prose.
+PROMPT
+)"
 
 state_initialized=false
 active_invocation_events=""

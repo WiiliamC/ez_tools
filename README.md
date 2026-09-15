@@ -410,6 +410,27 @@ The last argument is treated as the log file path. For shell syntax such as pipe
 Runs Codex review/fix cycles against a Git repository until the review is
 satisfied or the configured loop limit is reached.
 
+Reviews use ordinary `codex exec` with a read-only sandbox and an adapted copy of
+the [official Codex review guidelines](https://github.com/openai/codex/blob/a8964cb1bad67bc26a826fb07d1bef99c6a3f008/codex-rs/prompts/templates/review/rubric.md),
+synced on 2026-09-15. This is a custom review workflow, not the built-in `/review`
+command. The guidelines require actionable bugs introduced by the changes,
+supported by evidence, with standards appropriate to the repository.
+
+The existing JSON protocol remains `satisfied`, `summary`, and
+`findings: [{"issue": "..."}]`. Each issue includes a P0-P3 priority, file and line
+location, trigger conditions, and impact; findings based on project-specific
+rules also cite their source. Separate official priority, location, confidence,
+and overall-correctness fields are not used. Any qualifying finding, including
+P3, requests another fix; satisfaction requires an empty findings array.
+
+The prompt is embedded in the script and requires no runtime download. To update
+it manually, compare the pinned upstream rubric with a new upstream commit,
+adapt its review criteria while keeping only the existing output protocol, and
+update the source commit and sync date in the script and this section. Run the
+review loop and review-and-commit tests after updating. On resume, reviews that
+need execution receive the current prompt; completed saved results are consumed
+as before.
+
 ```bash
 ./review_untill_satisfied.sh --repo ../my-project/
 ./review_untill_satisfied.sh --repo ../my-project/ --fast
