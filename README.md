@@ -7,12 +7,12 @@ A collection of utility tools for Linux systems.
 Generates a commit message with Codex, then asks for confirmation unless `-y`
 is supplied. Includes all tracked changes, deletions, and non-ignored new files,
 even when files are only partially staged. Defaults to the current directory's
-Git repository and `gpt-5.3-codex-spark`.
+Git repository and `gpt-5.6-luna`.
 
 ```bash
 ./commit_by_codex.sh
 ./commit_by_codex.sh --repo ./example-project
-./commit_by_codex.sh --model gpt-5.3-codex-spark
+./commit_by_codex.sh --model gpt-5.6-luna
 ./commit_by_codex.sh -y
 ```
 
@@ -78,7 +78,7 @@ the commit step. The wrapper preserves the failing step's exit code.
 ```bash
 ./review_and_commit.sh
 ./review_and_commit.sh --repo ./example-project --max-loops 3 --fast
-./review_and_commit.sh --repo ./example-project --model gpt-5.3-codex-spark
+./review_and_commit.sh --repo ./example-project --model gpt-5.6-luna
 ```
 
 Defaults to the current directory's Git repository. `--repo` applies to both

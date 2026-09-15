@@ -13,7 +13,7 @@ Run review/fix cycles, then automatically commit only if review succeeds.
   --max-loops N     Maximum review/fix loops. Default: 12.
   --log-dir PATH    Review log directory outside the target repository.
   --fast            Use the Fast service tier for review/fix steps.
-  --model MODEL     Commit-message model. Default: gpt-5.3-codex-spark.
+  --model MODEL     Commit-message model. Default: gpt-5.6-luna.
   -h, --help        Show this help message.
 
 The commit step always uses -y to skip confirmation. Git hooks and signing

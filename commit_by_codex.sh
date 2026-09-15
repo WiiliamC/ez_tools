@@ -8,7 +8,7 @@ Usage: commit_by_codex.sh [--repo PATH] [--model MODEL] [-y]
 
 Generate a commit message with read-only Codex, then ask before committing all
 tracked changes and non-ignored new files. Requires Bash, Git, Python 3, Codex,
-and an interactive terminal unless -y is supplied. Default model: gpt-5.3-codex-spark.
+and an interactive terminal unless -y is supplied. Default model: gpt-5.6-luna.
 
   -y    Skip confirmation and commit without requiring an interactive terminal.
         Git hooks and signing retain their normal behavior.
@@ -16,7 +16,7 @@ HELP
 }
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 repo=.
-model=gpt-5.3-codex-spark
+model=gpt-5.6-luna
 auto_confirm=false
 while (($#)); do
     case "$1" in

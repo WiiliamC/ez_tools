@@ -24,7 +24,7 @@ import json, os, pathlib, subprocess, sys
 args = sys.argv[1:]
 assert args[0] == "exec"
 assert args[args.index("--sandbox") + 1] == "read-only"
-assert args[args.index("--model") + 1] == os.environ.get("EXPECTED_MODEL", "gpt-5.3-codex-spark")
+assert args[args.index("--model") + 1] == os.environ.get("EXPECTED_MODEL", "gpt-5.6-luna")
 assert "--ephemeral" in args and "--json" in args
 prompt = sys.stdin.read()
 assert "AGENTS.md" in prompt and "AGENTS.override.md" in prompt
@@ -88,7 +88,7 @@ print(json.dumps({"type": "turn.completed"}))
         before_tmp = set(Path('/tmp').glob('commit-by-codex.*'))
         process = subprocess.Popen(['bash', script, '--repo', str(repo), *options],
                                    stdin=slave, stdout=slave, stderr=slave,
-                                   env=dict(env, MOCK_MODE=mode, EXPECTED_MODEL=options[1] if options else "gpt-5.3-codex-spark"), start_new_session=True)
+                                   env=dict(env, MOCK_MODE=mode, EXPECTED_MODEL=options[1] if options else "gpt-5.6-luna"), start_new_session=True)
         os.close(slave)
         output = bytearray()
         answered = False
