@@ -190,8 +190,8 @@ used.
 
 Installs Ubuntu/Debian's Fcitx5, Rime and Lua support, downloads
 [Rime Ice (雾凇拼音)](https://github.com/iDvel/rime-ice), and sets full Pinyin as
-the default with the Material black theme. Existing input methods, including
-built-in Pinyin, remain available as fallbacks.
+the default with the Mellow Vermilion (朱砂, light) theme. Existing input methods,
+including built-in Pinyin, remain available as fallbacks.
 Run it as the logged-in desktop user, not through `sudo`:
 
 ```bash
@@ -201,23 +201,83 @@ Run it as the logged-in desktop user, not through `sudo`:
 fcitx5-config-qt                    # optional GUI configuration
 ```
 
-Log out and back in after installation. Rime Ice input is offline; existing
-built-in Pinyin cloud settings are preserved and still apply when using that
-fallback. The script no longer enables Baidu cloud candidates.
+Downloads and dictionary compilation finish in a temporary directory before
+changing the running session. When Fcitx5 is running, the script asks you to
+commit pending input and close its configuration windows, then requests a normal
+exit. It waits for both the process and D-Bus service to stop before reading and
+backing up the latest configuration. It then applies the changes, starts Fcitx5,
+selects Rime, and checks the live input method and disk profile. It never forces
+termination. Every install or configure run selects Mellow Vermilion, including
+upgrades from an existing theme. Other appearance settings (such as fonts),
+built-in Pinyin cloud settings and learned data are preserved; changed
+configuration is backed up. New configurations use a horizontal candidate list.
 
-Run `install` again to download the current upstream revision and update the
-resources. Rime data lives in `${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5/rime`.
-Custom patches, custom phrases and learned dictionaries are retained. Changed
-files receive adjacent `.bak.<timestamp>` backups; identical files are left
-alone. To restore a file, exit Fcitx5, copy its backup over the original, then
-start Fcitx5 and redeploy Rime. Rime directories containing symlinks are rejected
-to avoid overwriting linked files.
+While Rime Ice shows candidates, comma (`,`) turns to the previous page and
+period (`.`) turns to the next page. These keys are reserved for paging even on
+the first/last page; without candidates they retain normal punctuation behavior.
+The installer merges these bindings into `rime_ice.custom.yaml`, retaining other
+custom settings and shortcuts. Conflicting comma/period bindings are replaced.
+Unsupported complex key-binding patches or invalid YAML cause installation to
+stop before publishing changes; they require manual merging. YAML comments and
+formatting may be normalized when the custom patch changes.
 
-Downloads and dictionary compilation happen in a temporary directory before
-publishing resources or changing the default input method. A download or
-deployment failure leaves the existing input configuration intact (APT packages
-may already have been installed). `status` reports the upstream revision and
-required build files, but does not verify the active desktop session.
+To repair an existing installation without APT, downloads or compilation:
+Mellow resources and compiled paging rules must already be present. For an older
+installation, first run `install` to migrate; `configure` reports missing
+prerequisites instead of downloading or compiling them.
+
+```bash
+./install_fcitx5_pinyin.sh configure
+```
+
+Noninteractive runs that need a restart must pass `--yes`, which confirms that
+pending input has been committed and authorizes the restart. Configuration
+windows must still be closed. Without a desktop session, the script writes the
+configuration only after checking that Fcitx5 is stopped, and reports activation
+as pending login. Run `status` after login and verify typing and the Rime Ice
+schema in the desktop UI.
+
+Run `install` again to update Rime Ice and Mellow upstream resources.
+Only Mellow's Vermilion theme and its license are installed, under
+`${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5/themes/mellow-vermilion`;
+no upstream installation scripts are executed. Existing Material theme packages
+are not removed. Rime data lives in
+`${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5/rime`. Custom patches (apart from
+the managed paging bindings), phrases and learned dictionaries are retained. Changed files receive adjacent
+`.bak.<timestamp>` backups; identical files are left alone. Rime directories
+containing symlinks are rejected. Concurrent installer runs are rejected too.
+
+A theme/Rime download, resource validation or compilation failure leaves the
+existing input configuration intact (APT packages may already have been installed). A configuration-write
+failure restores the pre-write configuration where possible and attempts to
+restart the previous session. Published resources remain installed. Startup or
+verification failures return a nonzero status and explicitly report that
+activation is unconfirmed; use `configure` to retry.
+
+To restore configuration manually, close configuration windows, exit Fcitx5 and
+wait for it to stop **before** copying the desired backups over their originals;
+then start `fcitx5 -d`. If restoring Rime schema resources, redeploy Rime as well.
+`status` distinguishes installed resources, disk defaults, the live input method,
+Rime's recorded schema selection, Mellow resource availability and compiled
+comma/period bindings. The recorded schema is not proof of which
+schema is currently active.
+
+### Alternative Fcitx5 themes
+
+These skins change the candidate window and can be used with Rime Ice:
+
+| Theme | Style and previews |
+| --- | --- |
+| [Mellow](https://github.com/sanweiya/fcitx5-mellow-themes#screenshots) | Rounded corners; 釉蓝, 灰樱, 朱砂, 微言 and 石墨, with light/dark variants. This script selects **朱砂 light**. Chinese documentation. |
+| [WeChat-style](https://github.com/witt-bit/fcitx5-theme-wechat) | A candidate window inspired by WeChat input. Chinese documentation. |
+| [Fluent](https://github.com/Reverier-Xu/Fluent-fcitx5) | Fluent Design with shadow and blur effects; actual effects depend on the desktop. |
+| [Catppuccin](https://github.com/catppuccin/fcitx5) | Soft palettes, light/dark variants and optional rounded borders. |
+
+Mellow's upstream notes that X11 with HiDPI may scale poorly; Wayland HiDPI
+is supported. Its KWin blur variant is no longer published. See the
+[upstream compatibility notes](https://github.com/sanweiya/fcitx5-mellow-themes#注意).
+Select other installed themes using Fcitx5 Configuration → Addons → Classic User
+Interface. A later `install` or `configure` run selects Mellow Vermilion again.
 
 ## safe_ssh.sh
 

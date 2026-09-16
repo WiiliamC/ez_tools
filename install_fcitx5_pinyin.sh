@@ -3,17 +3,24 @@
 set -euo pipefail
 
 TAG='[install-fcitx5-pinyin]'
-PACKAGES=(fcitx5 fcitx5-chinese-addons fcitx5-config-qt fcitx5-frontend-all fcitx5-material-color im-config fcitx5-rime librime-plugin-lua librime-bin git python3 python3-yaml)
+PACKAGES=(fcitx5 fcitx5-chinese-addons fcitx5-config-qt fcitx5-frontend-all im-config fcitx5-rime librime-plugin-lua librime-bin git python3 python3-yaml)
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fcitx5"
 RIME_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5/rime"
+THEME_NAME=mellow-vermilion
+THEME_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5/themes/$THEME_NAME"
 
 usage() {
   cat <<'EOF'
-Usage: ./install_fcitx5_pinyin.sh [install|status|help]
+Usage: ./install_fcitx5_pinyin.sh [install|configure|status|help] [--yes]
 
 Install Fcitx5 with Rime Ice (full Pinyin) on Ubuntu/Debian APT systems.
-Existing input methods are retained. Running install again updates Rime Ice.
+Installs Mellow Vermilion and selects it, retaining other appearance settings.
+Comma/period turn candidate pages in Rime Ice. Existing input methods are retained.
+Running install again updates Rime Ice and Mellow.
 Run it as the desktop user, never with sudo.  No command means install.
+configure repairs an existing installation without APT, downloads or compilation.
+--yes confirms that pending input is committed and permits a session restart.
+Close Fcitx5 configuration windows before applying changes.
 EOF
 }
 
@@ -205,9 +212,114 @@ rime_build_present() {
      -s "$root/build/rime_ice.prism.bin" ]]
 }
 
+# Validate every referenced image before publishing a downloaded theme.
+theme_present() {
+  /usr/bin/python3 - "$1" <<'PYTHEME'
+import configparser
+import pathlib
+import sys
+try:
+    root = pathlib.Path(sys.argv[1])
+    config = configparser.ConfigParser(interpolation=None, strict=True)
+    with (root / "theme.conf").open() as stream:
+        config.read_file(stream)
+    assert config.has_section("InputPanel/Background")
+    for section in config.values():
+        for key in ("image", "overlay"):
+            value = section.get(key, "").strip().strip('"')
+            if value:
+                image = pathlib.Path(value)
+                assert not image.is_absolute() and ".." not in image.parts
+                assert (root / image).is_file() and (root / image).stat().st_size
+except (OSError, ValueError, AssertionError, configparser.Error):
+    sys.exit(1)
+PYTHEME
+}
+
+paging_present() {
+  /usr/bin/python3 - "$1/build/rime_ice.schema.yaml" <<'PYCHECK'
+import pathlib
+import sys
+import yaml
+try:
+    config = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text())
+    bindings = config["key_binder"]["bindings"]
+    for key, action in (("comma", "Page_Up"), ("period", "Page_Down")):
+        matching = [b for b in bindings if b.get("accept") == key]
+        assert matching and all(b.get("when") == "has_menu" and
+                                b.get("send") == action for b in matching)
+except (OSError, TypeError, KeyError, AttributeError, AssertionError, yaml.YAMLError):
+    sys.exit(1)
+PYCHECK
+}
+
+merge_paging() {
+  /usr/bin/python3 - "$1/rime_ice.custom.yaml" <<'PYPATCH'
+import pathlib
+import sys
+import yaml
+
+# Reject duplicate keys rather than silently discarding a user's settings.
+class UniqueLoader(yaml.SafeLoader):
+    pass
+
+def mapping(loader, node, deep=False):
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in result:
+            raise ValueError("duplicate YAML key")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
+path = pathlib.Path(sys.argv[1])
+try:
+    original = path.read_text() if path.is_file() else ""
+    config = yaml.load(original, Loader=UniqueLoader) if original else {}
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        raise ValueError("custom configuration must be a mapping")
+    patch = config.setdefault("patch", {})
+    if not isinstance(patch, dict):
+        raise ValueError("patch must be a mapping")
+    supported = {"key_binder/bindings", "key_binder/bindings/+"}
+    relevant = [k for k in patch if str(k).startswith("key_binder")]
+    if any(k not in supported for k in relevant) or len(relevant) > 1 or "__patch" in patch:
+        raise ValueError("complex key_binder patch requires manual merging")
+    key = relevant[0] if relevant else "key_binder/bindings/+"
+    bindings = patch.get(key, [])
+    if not isinstance(bindings, list) or any(not isinstance(b, dict) for b in bindings):
+        raise ValueError("bindings must be a list of mappings")
+    bindings = [b for b in bindings if b.get("accept") not in ("comma", "period")]
+    bindings.extend([
+        {"when": "has_menu", "accept": "comma", "send": "Page_Up"},
+        {"when": "has_menu", "accept": "period", "send": "Page_Down"},
+    ])
+    patch[key] = bindings
+    # Keep bytes unchanged when the parsed configuration already has our rules.
+    if not original or yaml.load(original, Loader=UniqueLoader) != config:
+        path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False))
+except (OSError, ValueError, TypeError, yaml.YAMLError) as error:
+    sys.exit("Cannot safely merge Rime paging configuration: " + str(error))
+PYPATCH
+}
+
+custom_fingerprint() {
+  local file
+  for file in default.custom.yaml rime_ice.custom.yaml; do
+    if [[ -f "$RIME_DATA_DIR/$file" ]]; then
+      sha256sum "$RIME_DATA_DIR/$file"
+    else
+      printf 'missing %s\n' "$file"
+    fi
+  done
+}
+
 # Build in isolation: a download or compilation error cannot overwrite live data.
 install_rime_ice() (
-  local work source stage destination file relative revision manifest
+  local work source stage destination file relative revision manifest custom_before theme_stage
   local -a existing_schemas=()
   destination="${RIME_DATA_DIR}"
   need_cmd git
@@ -233,6 +345,14 @@ install_rime_ice() (
      { [[ -d "$destination" ]] && [[ -n "$(find "$destination" -type l -print -quit)" ]]; }; then
     die 'Rime data contains symlinks; use a regular directory before installing'
   fi
+  custom_before="$(custom_fingerprint)"
+  git clone --quiet --depth 1 https://github.com/sanweiya/fcitx5-mellow-themes.git "$work/mellow"
+  theme_stage="$work/mellow/$THEME_NAME"
+  [[ -z "$(find "$work/mellow" -type l -print -quit)" ]] || die 'theme download contains symlinks'
+  theme_present "$theme_stage" || die 'Mellow theme resources are missing or invalid'
+  [[ -s "$work/mellow/LICENSE" ]] || die 'Mellow license is missing'
+  cp -- "$work/mellow/LICENSE" "$theme_stage/LICENSE"
+  git -C "$work/mellow" rev-parse HEAD >"$theme_stage/.mellow-version"
   mkdir -p "$stage"
   if [[ -d "$destination" ]]; then cp -a "$destination/." "$stage/"; fi
   # Capture the effective list before replacing default.yaml. --add-schema only
@@ -287,7 +407,8 @@ PY
     rime_deployer --add-schema "${existing_schemas[@]}" rime_ice
     rime_deployer --set-active-schema rime_ice
   )
-  printf '%s\0' .rime-ice-version default.custom.yaml user.yaml >>"$manifest"
+  merge_paging "$stage"
+  printf '%s\0' .rime-ice-version default.custom.yaml user.yaml rime_ice.custom.yaml >>"$manifest"
   # Always redeploy: custom inputs may have changed since the last successful build,
   # even when the downloaded resources match the live directory.
   # Discard copied build artifacts so they cannot mask a failed compilation.
@@ -299,19 +420,217 @@ PY
   while IFS= read -r -d '' file; do
     printf '%s\0' "${file#"$stage/"}" >>"$manifest"
   done < <(find "$stage/build" -type f -print0)
-  while IFS= read -r -d '' relative; do
-    replace_if_changed "$destination/$relative" "$stage/$relative"
-  done <"$manifest"
+  paging_present "$stage" || die 'compiled Rime Ice paging rules are missing or conflicting'
+  apply_session "$stage" "$manifest" "$custom_before" "$theme_stage"
   log "Rime Ice deployed: $revision"
 )
 
-configure_fcitx5() {
+# All live writes share this lifecycle, including repair-only configuration.
+remote() { timeout 2 fcitx5-remote "$@"; }
+checked_pgrep() {
+  local result
+  if pgrep -u "$(id -u)" "$@" >/dev/null; then return 0; else result=$?; fi
+  [[ "$result" == 1 ]] || die 'could not inspect session processes'
+  return 1
+}
+process_running() { checked_pgrep -x fcitx5; }
+config_window_running() {
+  checked_pgrep -f '(^|/)(fcitx5-config-qt|fcitx5-configtool)([[:space:]]|$)' >/dev/null
+}
+bus_owned() {
+  local reply
+  reply="$(timeout 2 dbus-send --session --type=method_call --print-reply \
+    --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+    org.freedesktop.DBus.NameHasOwner string:org.fcitx.Fcitx5 2>/dev/null)" || return 2
+  case "$reply" in
+    *'boolean true'*) return 0 ;;
+    *'boolean false'*) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+apply_session() (
+  local stage="${1:-}" manifest="${2:-}" custom_before="${3:-}" theme_stage="${4:-}" file relative answer bus_state
+  local desktop=False stopped=False phase=prepare snapshot deadline group live_group live_im
+  local -a managed=("$CONFIG_DIR/profile" "$CONFIG_DIR/conf/classicui.conf"
+    "$RIME_DATA_DIR/user.yaml" "$RIME_DATA_DIR/default.custom.yaml" "$RIME_DATA_DIR/rime_ice.custom.yaml" "$RIME_DATA_DIR/build/rime_ice.schema.yaml" "$HOME/.xinputrc")
+  for file in timeout dbus-send pgrep fcitx5-remote fcitx5 rime_deployer; do need_cmd "$file"; done
+  snapshot="$(mktemp -d)"
+  # EXIT also handles set -e failures; activation failures intentionally keep config.
+  cleanup_session() {
+    local result=$? i
+    trap - EXIT
+    if [[ "$phase" == writing && "$result" != 0 ]]; then
+      for i in "${!managed[@]}"; do
+        if [[ -f "$snapshot/$i" ]]; then
+          cp -p -- "$snapshot/$i" "${managed[$i]}" || log 'WARNING: configuration restore failed'
+        else
+          rm -f -- "${managed[$i]}" || log 'WARNING: configuration restore failed'
+        fi
+      done
+      log 'Configuration write failed; restored pre-write configuration where possible.'
+    fi
+    if [[ "$stopped" == True && "$phase" != activating && "$phase" != complete ]]; then
+      timeout 10 fcitx5 -d 9>&- >/dev/null 2>&1 || log 'WARNING: could not restore the original session'
+    fi
+    if [[ "$result" != 0 && "$phase" != prepare ]]; then
+      log 'Recovery: close configuration windows, exit Fcitx5 and wait for it to stop before restoring .bak files; then start fcitx5 -d.'
+      log 'Installed resources are retained. Run configure again to retry activation.'
+    fi
+    rm -rf -- "$snapshot"
+    exit "$result"
+  }
+  trap cleanup_session EXIT
+  config_window_running && die 'close Fcitx5 configuration windows before continuing'
+  if bus_owned; then bus_state=0; else bus_state=$?; fi
+  if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then desktop=True; fi
+  if process_running || [[ "$bus_state" == 0 ]]; then
+    [[ "$bus_state" == 0 ]] || die 'Fcitx5 is running but its session D-Bus cannot be reached; no configuration was written'
+    [[ "$desktop" == True ]] || die 'run from the desktop session to restart Fcitx5'
+    if [[ "$ASSUME_YES" != True ]]; then
+      [[ -t 0 ]] || die 'session restart requires interactive confirmation or --yes after committing pending input'
+      printf '%s Commit pending input and close configuration windows. Restart Fcitx5 now? [y/N] ' "$TAG"
+      read -r answer || die 'confirmation cancelled'
+      [[ "$answer" == y || "$answer" == Y ]] || die 'confirmation declined'
+    fi
+    config_window_running && die 'close Fcitx5 configuration windows before continuing'
+    remote -e || die 'could not request Fcitx5 exit; no configuration was written'
+    deadline=$((SECONDS + 10))
+    while :; do
+      if bus_owned; then bus_state=0; else bus_state=$?; fi
+      [[ "$bus_state" != 2 ]] || die 'lost D-Bus connection while waiting for exit; no configuration was written'
+      if ! process_running && [[ "$bus_state" == 1 ]]; then break; fi
+      (( SECONDS < deadline )) || die 'Fcitx5 did not exit within 10 seconds; no configuration was written'
+      sleep 0.2
+    done
+    stopped=True
+  elif [[ "$desktop" == True && "$bus_state" == 2 ]]; then
+    die 'desktop D-Bus is unavailable; no configuration was written'
+  fi
+  config_window_running && die 'a configuration window opened; no configuration was written'
+  process_running && die 'Fcitx5 restarted unexpectedly; no configuration was written'
+  # Snapshot only after the old process has finished saving its in-memory state.
+  for file in "${managed[@]}"; do
+    [[ ! -L "$file" && ! -d "$file" ]] || die 'managed configuration must be a regular file'
+  done
+  for relative in "${!managed[@]}"; do
+    file="${managed[$relative]}"
+    if [[ -f "$file" ]]; then cp -p -- "$file" "$snapshot/$relative"; fi
+  done
+  if [[ -n "$stage" && "$custom_before" != "$(custom_fingerprint)" ]]; then
+    die 'Rime schema configuration changed during preparation; retry install to compile the latest settings'
+  fi
+  if [[ -n "$theme_stage" ]]; then
+    [[ ! -L "$THEME_DIR" ]] || die 'theme destination must not be a symlink'
+    file="$THEME_DIR"
+    while [[ "$file" != / ]]; do
+      [[ ! -L "$file" ]] || die 'theme destination contains a symlink'
+      file="$(dirname "$file")"
+    done
+    if [[ -d "$THEME_DIR" ]]; then
+      [[ -z "$(find "$THEME_DIR" -type l -print -quit)" ]] || die 'theme destination contains symlinks'
+    fi
+    while IFS= read -r -d '' file; do
+      relative="${file#"$theme_stage/"}"
+      case "$relative" in
+        theme.conf|*.svg|*.png|LICENSE|.mellow-version)
+          file="$THEME_DIR/$relative"
+          [[ ! -d "$file" ]] || die 'theme resource destination is a directory'
+          if [[ -f "$file" ]]; then cp -p -- "$file" "$snapshot/${#managed[@]}"; fi
+          managed+=("$file") ;;
+      esac
+    done < <(find "$theme_stage" -type f -print0)
+  fi
+  phase=writing
+  if [[ -n "$theme_stage" ]]; then
+    while IFS= read -r -d '' file; do
+      relative="${file#"$theme_stage/"}"
+      case "$relative" in
+        theme.conf|*.svg|*.png|LICENSE|.mellow-version)
+          replace_if_changed "$THEME_DIR/$relative" "$file" ;;
+      esac
+    done < <(find "$theme_stage" -type f -print0)
+    theme_present "$THEME_DIR" || die 'published Mellow theme is incomplete'
+  fi
+  if [[ -n "$stage" ]]; then
+    # The daemon may have saved user.yaml during exit. Preserve those new fields.
+    if [[ -f "$RIME_DATA_DIR/user.yaml" ]]; then cp -p -- "$RIME_DATA_DIR/user.yaml" "$stage/user.yaml"; fi
+    (cd "$stage"; rime_deployer --set-active-schema rime_ice)
+    while IFS= read -r -d '' relative; do
+      replace_if_changed "$RIME_DATA_DIR/$relative" "$stage/$relative"
+    done <"$manifest"
+  else
+    mkdir -p "$snapshot/selection"
+    if [[ -f "$RIME_DATA_DIR/user.yaml" ]]; then cp -p -- "$RIME_DATA_DIR/user.yaml" "$snapshot/selection/user.yaml"; fi
+    (cd "$snapshot/selection"; rime_deployer --set-active-schema rime_ice)
+    replace_if_changed "$RIME_DATA_DIR/user.yaml" "$snapshot/selection/user.yaml"
+  fi
+  if [[ -n "$stage" ]]; then im-config -n fcitx5; fi
   create_or_merge_profile
-  upsert_keys "${CONFIG_DIR}/conf/classicui.conf" \
-    '' Theme Material-Color-black \
-    '' 'Vertical Candidate List' False \
-    '' PerScreenDPI True \
-    '' WheelForPaging True
+  # Select the managed theme while preserving other appearance settings.
+  if [[ ! -f "$CONFIG_DIR/conf/classicui.conf" ]]; then
+    upsert_keys "$CONFIG_DIR/conf/classicui.conf" \
+      '' Theme "$THEME_NAME" '' 'Vertical Candidate List' False \
+      '' PerScreenDPI True '' WheelForPaging True
+  else
+    upsert_keys "$CONFIG_DIR/conf/classicui.conf" '' Theme "$THEME_NAME"
+  fi
+  if [[ "$desktop" != True ]]; then
+    phase=complete
+    log 'Configured on disk; desktop activation is pending login and has not been verified.'
+    exit 0
+  fi
+  phase=activating
+  timeout 10 fcitx5 -d 9>&- >/dev/null 2>&1 || die 'configured but not confirmed active: Fcitx5 startup failed'
+  deadline=$((SECONDS + 10))
+  until bus_owned && remote --check >/dev/null 2>&1; do
+    (( SECONDS < deadline )) || die 'configured but not confirmed active: startup timed out'
+    sleep 0.2
+  done
+  group="$(awk '/^\[/ { active = ($0 == "[GroupOrder]") } active && /^0=/ { sub(/^0=/, ""); print; exit }' "$CONFIG_DIR/profile")"
+  [[ -n "$group" ]] || group="$(awk '/^\[/ { active = ($0 ~ /^\[Groups\/[0-9]+\]$/) } active && /^Name=/ { sub(/^Name=/, ""); print; exit }' "$CONFIG_DIR/profile")"
+  # D-Bus can be ready before applications reconnect their input contexts.
+  deadline=$((SECONDS + 10))
+  while :; do
+    remote -g "$group" && remote -s rime || die 'configured but not confirmed active: could not select Rime'
+    live_group="$(remote -q)" && live_im="$(remote -n)" || die 'configured but not confirmed active: could not query live input method'
+    [[ "$live_group" == "$group" && "$live_im" == rime ]] && break
+    if (( SECONDS >= deadline )); then
+      if [[ "$live_group" == "$group" && -z "$live_im" ]]; then
+        die 'configured but not confirmed active: no input context reconnected within 10 seconds; focus a text field and run configure again'
+      fi
+      die 'configured but not confirmed active: live input method differs'
+    fi
+    sleep 0.2
+  done
+  awk -v wanted="$group" '
+    /^\[/ { section=$0; active=($0 ~ /^\[Groups\/[0-9]+\]$/) }
+    active && /^Name=/ && substr($0,6)==wanted { target=section }
+    { lines[NR]=$0; sections[NR]=section }
+    END {
+      for (i=1;i<=NR;i++) {
+        if (sections[i]==target && lines[i]=="DefaultIM=rime") def=1
+        prefix=target; sub(/\]$/, "/Items/", prefix)
+        if (target!="" && index(sections[i],prefix)==1 && lines[i]=="Name=rime") item=1
+      }
+      exit !(def && item)
+    }' "$CONFIG_DIR/profile" || die 'configured but not confirmed active: disk profile differs'
+  phase=complete
+  log 'Rime is active and the disk profile selects Rime. Rime Ice selection is recorded; confirm the schema and typing in the desktop UI.'
+)
+
+configure_existing() {
+  local package
+  for package in fcitx5 fcitx5-rime librime-bin; do
+    package_installed "$package" || die "required package not installed: $package; run install"
+  done
+  rime_build_present "$RIME_DATA_DIR" || die 'Rime Ice build is missing or incomplete; run install'
+  if [[ -L "$RIME_DATA_DIR" ]] || [[ -n "$(find "$RIME_DATA_DIR" -type l -print -quit)" ]]; then
+    die 'Rime data contains symlinks; use a regular directory before configuring'
+  fi
+  theme_present "$THEME_DIR" || die 'Mellow theme missing or incomplete; run install'
+  paging_present "$RIME_DATA_DIR" || die 'compiled paging rules missing or conflicting; run install'
+  apply_session
 }
 
 show_status() {
@@ -354,6 +673,15 @@ show_status() {
     log 'Rime Ice build: missing or incomplete'
   fi
   log "theme: $theme_status"
+  if theme_present "$THEME_DIR"; then log 'Mellow Vermilion resources: present'; else log 'Mellow Vermilion resources: missing or incomplete'; fi
+  if paging_present "$RIME_DATA_DIR"; then log 'compiled comma/period paging: present'; else log 'compiled comma/period paging: missing or conflicting'; fi
+  log "recorded Rime selection (not a live query): $(grep 'previously_selected_schema:' "$RIME_DATA_DIR/user.yaml" 2>/dev/null || true)"
+  if command -v fcitx5-remote >/dev/null 2>&1 && command -v dbus-send >/dev/null 2>&1 && bus_owned; then
+    log "live group: $(remote -q 2>/dev/null || printf unknown)"
+    log "live input method: $(remote -n 2>/dev/null || printf unknown)"
+  else
+    log 'live session: unavailable; activation has not been verified'
+  fi
 }
 
 install_fcitx5() {
@@ -365,19 +693,33 @@ install_fcitx5() {
   sudo apt-get install -y "${PACKAGES[@]}"
   need_cmd im-config
   install_rime_ice
-  im-config -n fcitx5
-  configure_fcitx5
-  log 'configured Fcitx5 Rime Ice (full Pinyin). Log out and back in (or restart your session) to apply it.'
+
   log 'Rime Ice input is offline. Existing Pinyin and its cloud settings are retained as a fallback.'
 }
 
 main() {
-  [[ $# -le 1 ]] || { usage >&2; exit 1; }
-  case "${1:-install}" in
-    install) install_fcitx5 ;;
+  local action='' argument
+  ASSUME_YES=False
+  for argument in "$@"; do
+    case "$argument" in
+      --yes) ASSUME_YES=True ;;
+      install|configure|status|help|-h|--help)
+        [[ -z "$action" ]] || { usage >&2; exit 1; }
+        action="$argument" ;;
+      *) usage >&2; exit 1 ;;
+    esac
+  done
+  case "${action:-install}" in
+    install|configure)
+      check_target_user
+      check_apt_system
+      need_cmd flock
+      mkdir -p "$CONFIG_DIR"
+      exec 9>"$CONFIG_DIR/.installer.lock"
+      flock -n 9 || die 'another installer is running'
+      if [[ "${action:-install}" == install ]]; then install_fcitx5; else configure_existing; fi ;;
     status) show_status ;;
     help|-h|--help) usage ;;
-    *) usage >&2; exit 1 ;;
   esac
 }
 
