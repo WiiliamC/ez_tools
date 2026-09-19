@@ -31,6 +31,10 @@ EOF
   cat >"$bin/im-config" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${HOME}/im-config.calls"
+if [[ "$*" == '-n fcitx5' ]]; then
+  printf 'framework=fcitx5\n' >"$HOME/.xinputrc"
+  [[ "${STUB_IM_CONFIG_FAIL:-0}" == 0 ]] || exit 1
+fi
 EOF
   cat >"$bin/id" <<'EOF'
 #!/usr/bin/env bash
@@ -47,6 +51,10 @@ if [[ "$1" == clone ]]; then
     mkdir -p "$target/mellow-vermilion"
     printf '[InputPanel/Background]\nImage=panel.svg\n' >"$target/mellow-vermilion/theme.conf"
     printf '<svg/>\n' >"$target/mellow-vermilion/panel.svg"
+    printf '[InputPanel/Highlight]\nImage=highlight.svg\n[Menu/CheckBox]\nImage=ez-tools-menu-checkbox.png\n[Menu/SubMenu]\nImage=ez-tools-menu-submenu.png\n' >>"$target/mellow-vermilion/theme.conf"
+    printf '<svg/>\n' >"$target/mellow-vermilion/highlight.svg"
+    printf 'fixture checkbox\n' >"$target/mellow-vermilion/ez-tools-menu-checkbox.png"
+    printf 'fixture submenu\n' >"$target/mellow-vermilion/ez-tools-menu-submenu.png"
     printf 'fixture license\n' >"$target/LICENSE"
     [[ "${STUB_THEME_MISSING:-0}" == 0 ]] || rm "$target/mellow-vermilion/panel.svg"
     exit 0
@@ -176,6 +184,86 @@ run_install() {
 stub_bin="${tmp_dir}/bin"
 make_stubs "$stub_bin"
 
+# Test preparation against realistic upstream references, using isolated defaults.
+SCRIPT_UNDER_TEST="$script" THEME_TEST_ROOT="$tmp_dir/theme-unit" /usr/bin/python3 - <<'PYTHEMETEST'
+import os, pathlib, subprocess
+root = pathlib.Path(os.environ["THEME_TEST_ROOT"])
+root.mkdir()
+defaults = root / "default"
+defaults.mkdir()
+for name in ("radio.png", "arrow.png"):
+    (defaults / name).write_bytes(b"fixture png")
+script = pathlib.Path(os.environ["SCRIPT_UNDER_TEST"]).read_text().rsplit('main "$@"', 1)[0]
+base = ('# keep comment\n[InputPanel/Background]\nImage=panel.svg\n'
+        '[InputPanel/Highlight]\nImage=highlight.svg\n'
+        '[Menu/CheckBox]\nImage=radio.svg\n'
+        '[Menu/SubMenu]\nImage=arrow.svg\n')
+def fixture(name, config=base):
+    directory = root / name
+    directory.mkdir()
+    (directory / "theme.conf").write_text(config)
+    for image in ("panel.svg", "highlight.svg"):
+        (directory / image).write_text("<svg/>")
+    return directory
+
+def call(function, directory):
+    return subprocess.run(['bash', '-c', script + '\n' + function + ' "$1" "$2"',
+                           'test', str(directory), str(defaults)], capture_output=True, text=True)
+
+directory = fixture("missing-both")
+assert call("theme_present", directory).returncode != 0
+result = call("prepare_theme", directory)
+assert result.returncode == 0, result.stderr
+assert "radio.png" in result.stdout and "arrow.png" in result.stdout
+expected = base.replace("Image=radio.svg", "Image=ez-tools-menu-checkbox.png").replace(
+    "Image=arrow.svg", "Image=ez-tools-menu-submenu.png")
+assert (directory / "theme.conf").read_text() == expected
+assert call("theme_present", directory).returncode == 0
+snapshot = {p.name: p.read_bytes() for p in directory.iterdir()}
+assert call("prepare_theme", directory).returncode == 0
+assert snapshot == {p.name: p.read_bytes() for p in directory.iterdir()}
+directory = fixture("crlf")
+crlf = base.replace("Image=radio.svg", "iMaGe = radio.svg").replace("\n", "\r\n")
+(directory / "theme.conf").write_bytes(crlf.encode())
+assert call("prepare_theme", directory).returncode == 0
+assert (directory / "theme.conf").read_bytes() == crlf.replace(
+    "radio.svg", "ez-tools-menu-checkbox.png").replace(
+    "arrow.svg", "ez-tools-menu-submenu.png").encode()
+for present in (1, 2):
+    directory = fixture(f"present-{present}")
+    (directory / "radio.svg").write_text("<svg/>")
+    if present == 2:
+        (directory / "arrow.svg").write_text("<svg/>")
+    assert call("prepare_theme", directory).returncode == 0
+    assert "Image=radio.svg" in (directory / "theme.conf").read_text()
+    assert call("theme_present", directory).returncode == 0
+directory = fixture("empty-reference", base.replace("Image=radio.svg", "Image=").replace("Image=arrow.svg", "Image="))
+assert call("prepare_theme", directory).returncode == 0
+assert len(list(directory.iterdir())) == 3
+for name, config, broken, expected_error in (
+    ("unsafe", base.replace("radio.svg", "../radio.svg"), None, "unsafe resource path"),
+    ("absolute", base.replace("radio.svg", "/radio.svg"), None, "unsafe resource path"),
+    ("syntax", "invalid config", None, "theme validation"),
+    ("empty", base, "radio.svg", "empty or not a regular file"),
+    ("body", base.replace("panel.svg", "missing.svg"), None, "missing.svg"),
+    ("collision", base, "ez-tools-menu-checkbox.png", "already exists"),
+):
+    directory = fixture(name, config)
+    if broken:
+        (directory / broken).write_bytes(b"")
+    before = {p.name: p.read_bytes() for p in directory.iterdir()}
+    result = call("prepare_theme", directory)
+    assert result.returncode != 0 and expected_error in result.stderr, result
+    assert before == {p.name: p.read_bytes() for p in directory.iterdir()}
+for name in ("empty-default", "missing-default"):
+    if name == "empty-default":
+        (defaults / "radio.png").write_bytes(b"")
+    else:
+        (defaults / "radio.png").unlink()
+    result = call("prepare_theme", fixture(name))
+    assert result.returncode != 0 and "default theme resource radio.png" in result.stderr
+PYTHEMETEST
+
 # Fresh configuration creates a usable keyboard + Rime profile and compiled dictionary.
 fresh_home="${tmp_dir}/fresh"
 mkdir -p "$fresh_home"
@@ -194,6 +282,9 @@ assert_contains "${fresh_home}/.config/fcitx5/conf/classicui.conf" 'Theme=mellow
 [[ -s "$fresh_home/.local/share/fcitx5/themes/mellow-vermilion/LICENSE" ]] || fail 'theme license missing'
 [[ ! -e "$fresh_home/.local/share/fcitx5/themes/mellow-vermilion/.git" ]] || fail 'theme Git metadata installed'
 [[ "$(cat "$fresh_home/apt.calls")" != *fcitx5-material-color* ]] || fail 'still installs old default theme'
+
+assert_contains "${fresh_home}/.config/fcitx5/conf/classicui.conf" 'Font=Sans 16'
+assert_contains "$fresh_home/im-config.calls" '-n fcitx5'
 
 # An existing multi-IM profile is retained, Rime is merged into the first ordered group,
 # and a second run has no content changes or new backups.
@@ -388,13 +479,16 @@ run_configure() {
     bash "$script" configure "$@"
 }
 touch "$session_home/running"
+im_calls_before="$(wc -l <"$session_home/im-config.calls")"
 apt_before="$(cat "$session_home/apt.calls")"
 deploy_before="$(cat "$session_home/deploy.calls")"
 run_configure --yes >/dev/null
 assert_contains "$session_config/profile" 'DefaultIM=rime'
 assert_contains "$session_config/profile" 'Keep=latest'
 assert_contains "$session_config/conf/classicui.conf" 'Theme=mellow-vermilion'
-assert_contains "$session_config/conf/classicui.conf" 'Font=Example 12'
+assert_contains "$session_config/conf/classicui.conf" 'Font=Sans 16'
+[[ "$(wc -l <"$session_home/im-config.calls")" == "$((im_calls_before + 1))" ]] || fail 'configure did not set default framework'
+assert_contains "$session_home/.xinputrc" 'framework=fcitx5'
 [[ "$(cat "$session_home/apt.calls")" == "$apt_before" ]] || fail 'configure used APT'
 [[ "$(cat "$session_home/deploy.calls")" == "$deploy_before" ]] || fail 'configure compiled dictionaries'
 [[ "$(cat "$session_home/current-im")" == rime ]] || fail 'Rime not activated'
@@ -420,7 +514,7 @@ HOME="$session_home" XDG_CONFIG_HOME="$session_home/.config" PATH="$stub_bin:$PA
 assert_contains "$session_config/profile" 'DefaultIM=rime'
 assert_contains "$session_config/profile" 'Keep=latest'
 assert_contains "$session_config/conf/classicui.conf" 'Theme=mellow-vermilion'
-assert_contains "$session_config/conf/classicui.conf" 'Font=Example 12'
+assert_contains "$session_config/conf/classicui.conf" 'Font=Sans 16'
 
 # Refused/missing authorization and uncertain process state cannot change config.
 for failure in no_confirmation STUB_CONFIG_WINDOW STUB_BUS_FAIL STUB_PROCESS_FAIL STUB_EXIT_TIMEOUT; do
@@ -483,6 +577,7 @@ done
 cat >"$stub_bin/mv" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${STUB_WRITE_FAIL:-0}" == 1 && "${@: -1}" == */profile ]]; then exit 1; fi
+if [[ "${STUB_FONT_STATE_FAIL:-0}" == 1 && "${@: -1}" == */candidate-font.json ]]; then exit 1; fi
 exec /usr/bin/mv "$@"
 EOF
 chmod +x "$stub_bin/mv"
@@ -496,14 +591,20 @@ cmp -s "$session_config/profile" "$session_home/exit-profile" || fail 'write fai
 
 # An install write failure restores the theme and paging configuration too.
 session_data="$session_home/.local/share/fcitx5"
+printf 'old checkbox\n' >"$session_data/themes/mellow-vermilion/ez-tools-menu-checkbox.png"
+rm "$session_data/themes/mellow-vermilion/ez-tools-menu-submenu.png"
 printf '<svg>old theme</svg>\n' >"$session_data/themes/mellow-vermilion/panel.svg"
 printf 'patch: {menu/page_size: 9}\n' >"$session_data/rime/rime_ice.custom.yaml"
-restore_before="$(sha256sum "$session_data/themes/mellow-vermilion/panel.svg" "$session_data/rime/rime_ice.custom.yaml" "$session_data/rime/build/rime_ice.schema.yaml")"
+restore_before="$(sha256sum "$session_data/themes/mellow-vermilion/panel.svg" "$session_data/themes/mellow-vermilion/theme.conf" "$session_data/themes/mellow-vermilion/ez-tools-menu-checkbox.png" "$session_data/rime/rime_ice.custom.yaml" "$session_data/rime/build/rime_ice.schema.yaml")"
 if STUB_WRITE_FAIL=1 HOME="$session_home" XDG_CONFIG_HOME="$session_home/.config" PATH="$stub_bin:$PATH" DISPLAY=:99 bash "$script" install --yes >"$tmp_dir/failure-output" 2>&1; then
   fail 'install write failure succeeded'
 fi
-[[ "$restore_before" == "$(sha256sum "$session_data/themes/mellow-vermilion/panel.svg" "$session_data/rime/rime_ice.custom.yaml" "$session_data/rime/build/rime_ice.schema.yaml")" ]] || fail 'write failure did not restore theme/paging'
+[[ "$restore_before" == "$(sha256sum "$session_data/themes/mellow-vermilion/panel.svg" "$session_data/themes/mellow-vermilion/theme.conf" "$session_data/themes/mellow-vermilion/ez-tools-menu-checkbox.png" "$session_data/rime/rime_ice.custom.yaml" "$session_data/rime/build/rime_ice.schema.yaml")" ]] || fail 'write failure did not restore theme/paging'
 [[ -f "$session_home/running" ]] || fail 'install write failure did not restore session'
+[[ ! -e "$session_data/themes/mellow-vermilion/ez-tools-menu-submenu.png" ]] || fail 'rollback retained new PNG'
+# Restore the intentionally removed resource for subsequent configure tests.
+printf 'fixture submenu\n' >"$session_data/themes/mellow-vermilion/ez-tools-menu-submenu.png"
+
 
 # Offline configuration reports pending activation, and missing builds fail early.
 rm -f "$session_home/running"
@@ -532,7 +633,7 @@ patch:
 EOF
 run_install "$paging_home" "$stub_bin" >/dev/null
 assert_contains "$paging_home/.config/fcitx5/conf/classicui.conf" 'Theme=mellow-vermilion'
-assert_contains "$paging_home/.config/fcitx5/conf/classicui.conf" 'Font=Example 14'
+assert_contains "$paging_home/.config/fcitx5/conf/classicui.conf" 'Font=Example 22.4'
 /usr/bin/python3 - "$paging_dir/rime_ice.custom.yaml" <<'PYCHECK'
 import sys, yaml
 with open(sys.argv[1]) as stream:
@@ -578,6 +679,59 @@ for missing in theme paging; do
   grep -q 'run install' "$tmp_dir/paging-error" || fail 'configure omitted migration advice'
   cp "$tmp_dir/saved-resource" "$resource"
 done
+
+# Font scaling preserves style and fractional/px sizes and records a stable target.
+(
+  source <(sed '$d' "$script")
+  CONFIG_DIR="$tmp_dir/font-unit"
+  mkdir -p "$CONFIG_DIR/conf" "$tmp_dir/font-output"
+  for pair in 'Example Bold 12.5|Example Bold 20' 'Example 10.25px|Example 16.4px'; do
+    original="${pair%|*}"
+    expected="${pair#*|}"
+    printf 'Font=%s\n' "$original" >"$CONFIG_DIR/conf/classicui.conf"
+    prepare_candidate_font "$tmp_dir/font-output"
+    [[ "$(cat "$tmp_dir/font-output/candidate-font.txt")" == "$expected" ]] || fail 'incorrect scaled font'
+  done
+  cp "$tmp_dir/font-output/candidate-font.json" "$CONFIG_DIR/candidate-font.json"
+  printf 'Font=Example 99\n' >"$CONFIG_DIR/conf/classicui.conf"
+  prepare_candidate_font "$tmp_dir/font-output"
+  [[ "$(cat "$tmp_dir/font-output/candidate-font.txt")" == 'Example 16.4px' ]] || fail 'baseline was not reused'
+  # Migrate the previous 2x baseline without scaling the already enlarged font again.
+  printf '%s\n' '{"version":1,"original":"Example 12.5","target":"Example 25"}' >"$CONFIG_DIR/candidate-font.json"
+  prepare_candidate_font "$tmp_dir/font-output"
+  [[ "$(cat "$tmp_dir/font-output/candidate-font.txt")" == 'Example 20' ]] || fail 'old baseline migration failed'
+  cp "$tmp_dir/font-output/candidate-font.json" "$CONFIG_DIR/candidate-font.json"
+  prepare_candidate_font "$tmp_dir/font-output"
+  [[ "$(cat "$tmp_dir/font-output/candidate-font.txt")" == 'Example 20' ]] || fail 'migrated font scaled again'
+  printf '{}\n' >"$CONFIG_DIR/candidate-font.json"
+  if prepare_candidate_font "$tmp_dir/font-output" >/dev/null 2>&1; then fail 'invalid baseline accepted'; fi
+  rm "$CONFIG_DIR/candidate-font.json"
+  for font in 'Example zero' 'Example 0' 'Example -12'; do
+    printf 'Font=%s\n' "$font" >"$CONFIG_DIR/conf/classicui.conf"
+    if prepare_candidate_font "$tmp_dir/font-output" >/dev/null 2>&1; then fail 'invalid font accepted'; fi
+  done
+)
+
+# Framework write failure restores both existing configuration and absent baseline.
+rm -f "$session_home/running" "$session_config/candidate-font.json"
+printf 'Font=Example 12\n' >"$session_config/conf/classicui.conf"
+printf 'framework=previous\n' >"$session_home/.xinputrc"
+if STUB_IM_CONFIG_FAIL=1 HOME="$session_home" XDG_CONFIG_HOME="$session_home/.config" PATH="$stub_bin:$PATH" bash "$script" configure >"$tmp_dir/framework-error" 2>&1; then
+  fail 'framework write failure accepted'
+fi
+assert_contains "$session_home/.xinputrc" 'framework=previous'
+assert_contains "$session_config/conf/classicui.conf" 'Font=Example 12'
+[[ ! -e "$session_config/candidate-font.json" ]] || fail 'failed write left a baseline'
+if STUB_FONT_STATE_FAIL=1 HOME="$session_home" XDG_CONFIG_HOME="$session_home/.config" PATH="$stub_bin:$PATH" bash "$script" configure >"$tmp_dir/font-error" 2>&1; then
+  fail 'font state write failure accepted'
+fi
+assert_contains "$session_home/.xinputrc" 'framework=previous'
+assert_contains "$session_config/conf/classicui.conf" 'Font=Example 12'
+[[ ! -e "$session_config/candidate-font.json" ]] || fail 'font failure left a baseline'
+HOME="$session_home" XDG_CONFIG_HOME="$session_home/.config" PATH="$stub_bin:$PATH" bash "$script" configure >/dev/null
+assert_contains "$session_config/conf/classicui.conf" 'Font=Example 19.2'
+HOME="$session_home" XDG_CONFIG_HOME="$session_home/.config" PATH="$stub_bin:$PATH" bash "$script" configure >/dev/null
+assert_contains "$session_config/conf/classicui.conf" 'Font=Example 19.2'
 
 # Exercise the actual Rime compiler when available, with isolated minimal data.
 if [[ -x /usr/bin/rime_deployer ]]; then

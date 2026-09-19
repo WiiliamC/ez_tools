@@ -208,7 +208,13 @@ exit. It waits for both the process and D-Bus service to stop before reading and
 backing up the latest configuration. It then applies the changes, starts Fcitx5,
 selects Rime, and checks the live input method and disk profile. It never forces
 termination. Every install or configure run selects Mellow Vermilion, including
-upgrades from an existing theme. Other appearance settings (such as fonts),
+upgrades from an existing theme. Candidate font size is set to 1.6 times its first
+configured value, keeping the font family and style; absent a font setting,
+`Sans 10` becomes `Sans 16`. The original and target font are recorded in
+`${XDG_CONFIG_HOME:-$HOME/.config}/fcitx5/candidate-font.json`, so later runs
+reuse the target instead of scaling again. Existing 2x baseline records are
+automatically migrated to 1.6x (80% of the previously enlarged size). Invalid font sizes or baseline
+records cause an error. Other appearance settings,
 built-in Pinyin cloud settings and learned data are preserved; changed
 configuration is backed up. New configurations use a horizontal candidate list.
 
@@ -234,13 +240,23 @@ Noninteractive runs that need a restart must pass `--yes`, which confirms that
 pending input has been committed and authorizes the restart. Configuration
 windows must still be closed. Without a desktop session, the script writes the
 configuration only after checking that Fcitx5 is stopped, and reports activation
-as pending login. Run `status` after login and verify typing and the Rime Ice
+as pending login. Both `install` and `configure` set Fcitx5 as the current
+user's default input framework using `im-config`, and select Rime Ice.
+Log out and back in so applications inherit the framework setting.
+Run `status` after login and verify typing and the Rime Ice
 schema in the desktop UI.
 
 Run `install` again to update Rime Ice and Mellow upstream resources.
 Only Mellow's Vermilion theme and its license are installed, under
 `${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5/themes/mellow-vermilion`;
-no upstream installation scripts are executed. Existing Material theme packages
+no upstream installation scripts are executed. If Mellow references missing menu
+checkbox or submenu icons, installation copies `radio.png` or `arrow.png` from
+the system Fcitx5 default theme (`fcitx5-data`) and updates those references in
+the staged theme, logging each substitution. Existing icons and empty references
+are retained. All referenced images must then be nonempty files; other missing
+resources fail with the configuration section and filename. Run `install` to
+repair an older incomplete theme; `configure` only checks existing resources.
+Existing Material theme packages
 are not removed. Rime data lives in
 `${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5/rime`. Custom patches (apart from
 the managed paging bindings), phrases and learned dictionaries are retained. Changed files receive adjacent

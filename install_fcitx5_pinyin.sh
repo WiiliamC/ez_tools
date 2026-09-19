@@ -3,7 +3,7 @@
 set -euo pipefail
 
 TAG='[install-fcitx5-pinyin]'
-PACKAGES=(fcitx5 fcitx5-chinese-addons fcitx5-config-qt fcitx5-frontend-all im-config fcitx5-rime librime-plugin-lua librime-bin git python3 python3-yaml)
+PACKAGES=(fcitx5 fcitx5-data fcitx5-chinese-addons fcitx5-config-qt fcitx5-frontend-all im-config fcitx5-rime librime-plugin-lua librime-bin git python3 python3-yaml)
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fcitx5"
 RIME_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5/rime"
 THEME_NAME=mellow-vermilion
@@ -14,7 +14,9 @@ usage() {
 Usage: ./install_fcitx5_pinyin.sh [install|configure|status|help] [--yes]
 
 Install Fcitx5 with Rime Ice (full Pinyin) on Ubuntu/Debian APT systems.
-Installs Mellow Vermilion and selects it, retaining other appearance settings.
+Selects Mellow Vermilion and sets candidate font size to 1.6 times its initial size.
+install and configure set Fcitx5 as the current user default input framework.
+Log out and back in for applications to inherit the input framework setting.
 Comma/period turn candidate pages in Rime Ice. Existing input methods are retained.
 Running install again updates Rime Ice and Mellow.
 Run it as the desktop user, never with sudo.  No command means install.
@@ -117,6 +119,53 @@ upsert_keys() {
   replace_if_changed "$file" "$current"
 }
 
+# Prepare the font and persistent baseline without changing live configuration.
+prepare_candidate_font() {
+  /usr/bin/python3 - "$CONFIG_DIR/conf/classicui.conf" "$CONFIG_DIR/candidate-font.json" "$1" <<'PYFONT'
+import json
+import pathlib
+import re
+import sys
+from decimal import Decimal
+
+config, state, output = map(pathlib.Path, sys.argv[1:])
+
+def scaled(font, factor="1.6"):
+    match = re.fullmatch(r"(.+?)\s+([0-9]+(?:\.[0-9]+)?)(px)?", font.strip())
+    if not match or Decimal(match[2]) <= 0:
+        raise ValueError("candidate font must end with a positive numeric size")
+    size = format(Decimal(match[2]) * Decimal(factor), "f")
+    if "." in size:
+        size = size.rstrip("0").rstrip(".")
+    return f"{match[1]} {size}{match[3] or ''}"
+
+try:
+    if state.exists():
+        record = json.loads(state.read_text())
+        if (not isinstance(record, dict) or record.get("version") not in (1, 2)
+                or not isinstance(record.get("original"), str)
+                or record.get("target") != scaled(record["original"], "2" if record["version"] == 1 else "1.6")):
+            raise ValueError("invalid candidate font baseline")
+        record = {"version": 2, "original": record["original"],
+                  "target": scaled(record["original"])}
+    else:
+        font = "Sans 10"
+        if config.exists():
+            for line in config.read_text().splitlines():
+                if line.strip().startswith("["):
+                    break
+                match = re.match(r"^\s*Font\s*=\s*(.*?)\s*$", line)
+                if match:
+                    font = match[1]
+                    break
+        record = {"version": 2, "original": font, "target": scaled(font)}
+    (output / "candidate-font.json").write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+    (output / "candidate-font.txt").write_text(record["target"])
+except (OSError, ValueError, TypeError) as error:
+    sys.exit("Cannot prepare candidate font: " + str(error))
+PYFONT
+}
+
 create_or_merge_profile() {
   local profile="${CONFIG_DIR}/profile" tmp target_group max_item preferred_group next
   mkdir -p "$CONFIG_DIR"
@@ -212,26 +261,81 @@ rime_build_present() {
      -s "$root/build/rime_ice.prism.bin" ]]
 }
 
-# Validate every referenced image before publishing a downloaded theme.
-theme_present() {
-  /usr/bin/python3 - "$1" <<'PYTHEME'
+# Preparation and all read-only checks share the same resource contract.
+theme_present() { theme_resources "$1"; }
+prepare_theme() { theme_resources "$1" "${2:-/usr/share/fcitx5/themes/default}"; }
+
+theme_resources() {
+  /usr/bin/python3 - "$@" <<'PYTHEME'
 import configparser
 import pathlib
+import re
+import shutil
 import sys
+
 try:
     root = pathlib.Path(sys.argv[1])
+    fallback = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else None
     config = configparser.ConfigParser(interpolation=None, strict=True)
-    with (root / "theme.conf").open() as stream:
-        config.read_file(stream)
-    assert config.has_section("InputPanel/Background")
-    for section in config.values():
+    with (root / "theme.conf").open(encoding="utf-8", newline="") as stream:
+        original = stream.read()
+    config.read_string(original)
+    if not config.has_section("InputPanel/Background"):
+        raise ValueError("theme.conf: missing [InputPanel/Background]")
+    defaults = {
+        "Menu/CheckBox": ("radio.png", "ez-tools-menu-checkbox.png"),
+        "Menu/SubMenu": ("arrow.png", "ez-tools-menu-submenu.png"),
+    }
+    repairs = {}
+    for name, section in config.items():
         for key in ("image", "overlay"):
             value = section.get(key, "").strip().strip('"')
-            if value:
-                image = pathlib.Path(value)
-                assert not image.is_absolute() and ".." not in image.parts
-                assert (root / image).is_file() and (root / image).stat().st_size
-except (OSError, ValueError, AssertionError, configparser.Error):
+            if not value:
+                continue
+            label = f"[{name}] {key}={value}"
+            image = pathlib.Path(value)
+            if image.is_absolute() or ".." in image.parts:
+                raise ValueError(f"{label}: unsafe resource path")
+            target = root / image
+            if any(p.is_symlink() for p in (target, *target.parents)):
+                raise ValueError(f"{label}: symbolic link is not allowed")
+            if target.is_file() and target.stat().st_size:
+                continue
+            if target.exists():
+                raise ValueError(f"{label}: resource is empty or not a regular file")
+            if fallback is None or key != "image" or name not in defaults:
+                raise ValueError(f"{label}: resource is missing")
+            source_name, destination = defaults[name]
+            source = fallback / source_name
+            if not source.is_file() or not source.stat().st_size:
+                raise ValueError(f"{label}: default theme resource {source_name} is missing or empty")
+            if (root / destination).exists() or (root / destination).is_symlink():
+                raise ValueError(f"{label}: fallback destination {destination} already exists")
+            repairs[name] = (source, destination, label)
+    # Validate everything before modifying the isolated stage. Preserve comments,
+    # key spelling and unrelated settings instead of serializing ConfigParser.
+    lines = original.splitlines(keepends=True)
+    current = None
+    replaced = set()
+    for index, line in enumerate(lines):
+        section = re.match(r"^\s*\[([^]]+)\]", line)
+        if section:
+            current = section.group(1)
+        elif current in repairs:
+            match = re.match(r"^(\s*image\s*[=:]\s*)[^\r\n]*(\r?\n)?$", line, re.I)
+            if match:
+                lines[index] = match[1] + repairs[current][1] + (match[2] or "")
+                replaced.add(current)
+    if replaced != set(repairs):
+        raise ValueError("theme.conf: cannot safely rewrite menu Image entries")
+    for source, destination, label in repairs.values():
+        shutil.copyfile(source, root / destination)
+        print(f"[install-fcitx5-pinyin] {label}: using default theme {source.name} as {destination}")
+    if repairs:
+        with (root / "theme.conf").open("w", encoding="utf-8", newline="") as stream:
+            stream.write("".join(lines))
+except (OSError, ValueError, configparser.Error) as error:
+    print(f"[install-fcitx5-pinyin] theme validation: {error}", file=sys.stderr)
     sys.exit(1)
 PYTHEME
 }
@@ -349,6 +453,7 @@ install_rime_ice() (
   git clone --quiet --depth 1 https://github.com/sanweiya/fcitx5-mellow-themes.git "$work/mellow"
   theme_stage="$work/mellow/$THEME_NAME"
   [[ -z "$(find "$work/mellow" -type l -print -quit)" ]] || die 'theme download contains symlinks'
+  prepare_theme "$theme_stage" || die 'could not prepare Mellow theme resources'
   theme_present "$theme_stage" || die 'Mellow theme resources are missing or invalid'
   [[ -s "$work/mellow/LICENSE" ]] || die 'Mellow license is missing'
   cp -- "$work/mellow/LICENSE" "$theme_stage/LICENSE"
@@ -451,10 +556,10 @@ bus_owned() {
 
 apply_session() (
   local stage="${1:-}" manifest="${2:-}" custom_before="${3:-}" theme_stage="${4:-}" file relative answer bus_state
-  local desktop=False stopped=False phase=prepare snapshot deadline group live_group live_im
-  local -a managed=("$CONFIG_DIR/profile" "$CONFIG_DIR/conf/classicui.conf"
+  local desktop=False stopped=False phase=prepare snapshot deadline group live_group live_im candidate_font
+  local -a managed=("$CONFIG_DIR/profile" "$CONFIG_DIR/conf/classicui.conf" "$CONFIG_DIR/candidate-font.json"
     "$RIME_DATA_DIR/user.yaml" "$RIME_DATA_DIR/default.custom.yaml" "$RIME_DATA_DIR/rime_ice.custom.yaml" "$RIME_DATA_DIR/build/rime_ice.schema.yaml" "$HOME/.xinputrc")
-  for file in timeout dbus-send pgrep fcitx5-remote fcitx5 rime_deployer; do need_cmd "$file"; done
+  for file in timeout dbus-send pgrep fcitx5-remote fcitx5 rime_deployer im-config /usr/bin/python3; do need_cmd "$file"; done
   snapshot="$(mktemp -d)"
   # EXIT also handles set -e failures; activation failures intentionally keep config.
   cleanup_session() {
@@ -541,6 +646,8 @@ apply_session() (
       esac
     done < <(find "$theme_stage" -type f -print0)
   fi
+  prepare_candidate_font "$snapshot"
+  candidate_font="$(cat "$snapshot/candidate-font.txt")"
   phase=writing
   if [[ -n "$theme_stage" ]]; then
     while IFS= read -r -d '' file; do
@@ -565,9 +672,9 @@ apply_session() (
     (cd "$snapshot/selection"; rime_deployer --set-active-schema rime_ice)
     replace_if_changed "$RIME_DATA_DIR/user.yaml" "$snapshot/selection/user.yaml"
   fi
-  if [[ -n "$stage" ]]; then im-config -n fcitx5; fi
+  im-config -n fcitx5
   create_or_merge_profile
-  # Select the managed theme while preserving other appearance settings.
+  # Select the managed theme and stable scaled font, preserving other settings.
   if [[ ! -f "$CONFIG_DIR/conf/classicui.conf" ]]; then
     upsert_keys "$CONFIG_DIR/conf/classicui.conf" \
       '' Theme "$THEME_NAME" '' 'Vertical Candidate List' False \
@@ -575,6 +682,9 @@ apply_session() (
   else
     upsert_keys "$CONFIG_DIR/conf/classicui.conf" '' Theme "$THEME_NAME"
   fi
+  upsert_keys "$CONFIG_DIR/conf/classicui.conf" '' Font "$candidate_font"
+  replace_if_changed "$CONFIG_DIR/candidate-font.json" "$snapshot/candidate-font.json"
+  log 'Fcitx5 is configured as the current user default; log out and back in for applications to inherit this setting.'
   if [[ "$desktop" != True ]]; then
     phase=complete
     log 'Configured on disk; desktop activation is pending login and has not been verified.'
@@ -673,6 +783,13 @@ show_status() {
     log 'Rime Ice build: missing or incomplete'
   fi
   log "theme: $theme_status"
+  log "candidate font: $(grep '^Font=' "$CONFIG_DIR/conf/classicui.conf" 2>/dev/null || printf 'not configured')"
+  if [[ -f "$CONFIG_DIR/candidate-font.json" ]]; then
+    log 'candidate font baseline: recorded (repeat runs reuse the 1.6x size)'
+  else
+    log 'candidate font baseline: not recorded'
+  fi
+  log 'Default input framework is per user; log out and back in after changes.'
   if theme_present "$THEME_DIR"; then log 'Mellow Vermilion resources: present'; else log 'Mellow Vermilion resources: missing or incomplete'; fi
   if paging_present "$RIME_DATA_DIR"; then log 'compiled comma/period paging: present'; else log 'compiled comma/period paging: missing or conflicting'; fi
   log "recorded Rime selection (not a live query): $(grep 'previously_selected_schema:' "$RIME_DATA_DIR/user.yaml" 2>/dev/null || true)"
