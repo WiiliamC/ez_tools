@@ -1154,3 +1154,132 @@ exec 8>"${fix_resume_log}.lock"
 flock -n 8
 assert_resume_error "already active" --resume "${fix_resume_log}"
 flock -u 8
+
+# Exercise the wrapper with the real review state machine and a fake commit.
+python3 - "${repo_root}" "${tmp_dir}" "${test_repo}" <<'PY'
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+source, root, repo = map(Path, sys.argv[1:])
+scripts = root / 'wrapper scripts'
+scripts.mkdir()
+for name in ('review_and_commit.sh', 'review_untill_satisfied.sh', 'terminal_tab_spinner.sh'):
+    shutil.copyfile(source / name, scripts / name)
+(scripts / 'commit_by_codex.sh').write_text('''#!/usr/bin/env bash
+python3 - "$@" <<'COMMIT'
+import json, os, sys
+from pathlib import Path
+assert 'REVIEW_UNTIL_RESULT_FILE' not in os.environ
+Path(os.environ['COMMIT_CALL']).write_text(json.dumps(sys.argv[1:]))
+COMMIT
+''')
+wrapper = scripts / 'review_and_commit.sh'
+review = scripts / 'review_untill_satisfied.sh'
+commit_call = root / 'commit-call'
+scratch = root / 'wrapper scratch'
+scratch.mkdir()
+env = dict(os.environ, TMPDIR=str(scratch), COMMIT_CALL=str(commit_call),
+           FAKE_CODEX_STATE=str(root / 'wrapper-codex-state'),
+           FAKE_CODEX_PROCESS_LOG=str(root / 'wrapper-processes'),
+           FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"clean","findings":[]}')
+env.pop('REVIEW_UNTIL_RESULT_FILE', None)
+
+def run(entry, args, cwd=root, **overrides):
+    commit_call.unlink(missing_ok=True)
+    result = subprocess.run(['bash', str(entry), *map(str, args)], cwd=cwd,
+                            env=dict(env, **overrides), capture_output=True, timeout=15)
+    assert not list(scratch.iterdir()), 'Temporary directories leaked'
+    return result
+
+def rejected(args):
+    result = run(wrapper, args)
+    assert result.returncode == 2 and not commit_call.exists(), (args, result)
+
+# Verify the internal result format independently of the wrapper.
+report = root / 'review-result'
+result = run(review, ['--repo', repo, '--log-dir', root / 'result-logs'],
+             REVIEW_UNTIL_RESULT_FILE=str(report))
+assert result.returncode == 0, result.stderr
+assert report.read_bytes() == os.fsencode(repo) + b'\0'
+report.unlink()
+result = run(review, ['--unknown'], REVIEW_UNTIL_RESULT_FILE=str(report))
+assert result.returncode == 2 and not report.exists()
+result = run(wrapper, ['--log-dir', root / 'wrapper-fresh-logs'], cwd=repo)
+assert result.returncode == 0, result.stderr
+assert json.loads(commit_call.read_text()) == ['--repo', str(repo), '-y']
+
+for mode in ('explicit', 'equals', 'bare', 'drift'):
+    Path(env['FAKE_CODEX_STATE']).unlink(missing_ok=True)
+    logs = root / ('wrapper logs ' + mode)
+    result = run(wrapper, ['--repo', repo, '--max-loops', '2', '--log-dir', logs],
+                 FAKE_CODEX_FAIL_ON_CALL='1')
+    assert result.returncode == 7 and not commit_call.exists(), result
+    log, = logs.glob('*.log')
+    rejected(['--resume', log, '--fast'])
+    rejected(['--resume', log, '--log-dir', logs])
+    rejected(['--resume', log, '--repo', source])
+    drift = repo / 'wrapper-drift.txt'
+    if mode == 'drift':
+        drift.write_text('expected change\n')
+        rejected(['--resume', log])
+    if mode == 'equals':
+        args = ['--resume=' + str(log)]
+    elif mode == 'bare':
+        args = ['--repo', repo, '--log-dir', logs, '--resume']
+    else:
+        args = ['--resume', log]
+    if mode == 'drift':
+        args += ['--allow-worktree-changes']
+    args += ['--model', 'example-model']
+    # Explicit recovery also works when the current directory is another repo.
+    result = run(wrapper, args, cwd=source if mode == 'equals' else root)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(commit_call.read_text()) == ['--repo', str(repo), '--model', 'example-model', '-y']
+    rejected(['--resume', log])  # A passed review cannot retry a commit.
+    drift.unlink(missing_ok=True)
+
+rejected(['--unknown'])
+rejected(['--repo', root])
+rejected(['--repo'])
+rejected(['--resume='])
+
+# Signals sent to the outer wrapper must stop review and its Codex descendants.
+for sig in (signal.SIGTERM, signal.SIGINT):
+    Path(env['FAKE_CODEX_STATE']).unlink(missing_ok=True)
+    processes = Path(env['FAKE_CODEX_PROCESS_LOG'])
+    processes.unlink(missing_ok=True)
+    commit_call.unlink(missing_ok=True)
+    logs = root / ('wrapper-interrupt-' + sig.name)
+    child = subprocess.Popen(['bash', str(wrapper), '--repo', str(repo), '--log-dir', str(logs)],
+                             env=dict(env, FAKE_CODEX_HANG_ON_CALL='1'),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 10
+        while not (processes.exists() and processes.read_text().strip()):
+            assert child.poll() is None, 'Wrapper exited before review started'
+            assert time.monotonic() < deadline, 'Codex did not start'
+            time.sleep(0.05)
+        pids = list(map(int, processes.read_text().split()))
+        child.send_signal(sig)
+        assert child.wait(timeout=10) == 128 + sig
+        assert not commit_call.exists()
+        assert not list(scratch.iterdir())
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise AssertionError(f'Review descendant survived: {pid}')
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=10)
+print('review-and-commit integration tests passed')
+PY

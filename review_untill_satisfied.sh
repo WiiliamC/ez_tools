@@ -1066,6 +1066,10 @@ while [ "$loop" -le "$max_loops" ]; do
             write_state
             echo "Review passed on loop ${loop}. Log: ${log_file}"
             echo "Review passed on loop ${loop}" >> "$log_file"
+            # Internal wrapper result: one NUL-terminated repository path.
+            if [ -n "${REVIEW_UNTIL_RESULT_FILE:-}" ]; then
+                printf '%s\0' "$project_root" > "$REVIEW_UNTIL_RESULT_FILE"
+            fi
             exit 0
         fi
         if [ "$loop" -eq "$max_loops" ]; then

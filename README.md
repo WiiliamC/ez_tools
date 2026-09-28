@@ -80,13 +80,21 @@ the commit step. The wrapper preserves the failing step's exit code.
 ./review_and_commit.sh
 ./review_and_commit.sh --repo ./example-project --max-loops 3 --fast
 ./review_and_commit.sh --repo ./example-project --model gpt-5.6-luna
+./review_and_commit.sh --resume ./review-logs/original-run.log
+./review_and_commit.sh --repo ./example-project --resume --allow-worktree-changes
 ```
 
-Defaults to the current directory's Git repository. `--repo` applies to both
-steps; `--max-loops`, `--log-dir`, and `--fast` apply only to review/fix, while
-`--model` selects only the commit-message model. Relative paths are interpreted
-from the caller's working directory. Resume options are not supported by this
-wrapper. Use `--help` for options. Dependencies are those of both child scripts;
+All arguments except `--model` and help are forwarded unchanged to the review
+script, which owns argument validation and repository selection. `--model`
+selects only the commit-message model. Relative paths are interpreted from the
+caller's working directory. By default review uses the current directory's Git
+repository; explicit `--resume LOG` (also `--resume=LOG`) can select the repository
+from the saved run even outside a Git directory. An explicit `--repo` must match
+that run. Bare `--resume` selects the newest eligible incomplete run for the
+selected repository. The commit always targets the repository reported by a
+successful review. All review resume constraints apply, including the restriction
+on `--fast` and the rejection of already passed runs; resume cannot retry only a
+failed commit. Use `--help` for options. Dependencies are those of both child scripts;
 Git hooks and signing retain their normal behavior.
 
 Run isolated wrapper tests with `bash tests/review_and_commit_test.sh`.
