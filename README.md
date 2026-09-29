@@ -2,6 +2,111 @@
 
 A collection of utility tools for Linux systems.
 
+## system_blackbox.py / system_blackbox.sh
+
+Records Linux system activity for investigating abrupt shutdowns. Uses Python 3
+standard-library code and independent collector processes, so a stalled GPU or
+hardware query does not stop other metrics from being written. No packages are
+installed automatically. Intended for Ubuntu with systemd; NVIDIA telemetry
+requires `nvidia-smi`, and optional disk health collection requires `smartctl`.
+
+Defaults: **one sample per second, two local calendar days of logs** (today and
+yesterday), under `/var/log/system-blackbox/`. Files are named `YYYY-MM-DD.jsonl`.
+The collector writes compact JSONL, syncs the file after each sample, and syncs
+the directory when creating a daily file. Directory/file permissions are
+`0700`/`0600`. Actual hardware power loss can still lose the final sample.
+
+Run privileged installation commands yourself in a terminal, from the repository:
+
+```bash
+sudo ./system_blackbox.sh install
+# Customize retention, sampling interval, and dedicated log directory:
+sudo ./system_blackbox.sh install --retention-days 3 --interval 1 --log-dir /var/log/system-blackbox
+./system_blackbox.sh status
+sudo python3 /usr/local/lib/system-blackbox/system_blackbox.py status
+sudo python3 /usr/local/lib/system-blackbox/system_blackbox.py report
+# Inspect this boot, without querying journal:
+sudo python3 /usr/local/lib/system-blackbox/system_blackbox.py report --boot-id current --no-journal
+sudo ./system_blackbox.sh uninstall
+```
+
+Installation copies the collector into `/usr/local/lib/system-blackbox`, writes
+`/etc/default/system-blackbox` and a systemd unit, then enables and restarts the
+service. Reinstall replaces the service configuration with supplied options and
+defaults. For a custom log directory, also pass `--log-dir` to Python `status` and
+`report`. Uninstall stops the service but preserves logs and configuration.
+The root service is needed for restricted energy counters and process I/O;
+unprivileged foreground runs work with unavailable metrics explicitly marked.
+
+For a bounded local trial without installing a service:
+
+```bash
+python3 system_blackbox.py run --log-dir /tmp/blackbox-example --duration 60
+python3 system_blackbox.py status --log-dir /tmp/blackbox-example
+python3 system_blackbox.py report --log-dir /tmp/blackbox-example --boot-id current --no-journal
+python3 tests/system_blackbox_test.py
+```
+
+Metrics and cadence:
+
+| Cadence | Recorded data |
+| --- | --- |
+| Every sample (default 1 second) | Overall/per-core CPU usage and available frequency, load, memory/swap, PSI, physical-disk I/O rates/latency/queues, interface traffic/errors, readable hwmon temperatures/fans/power, RAPL domain power, NVIDIA GPU utilization/memory/temperature/power/clocks/active clock-event mask |
+| Every 10 seconds | Union of top 10 processes by CPU, RSS, and disk I/O; PID, short process name, and metrics only |
+| Every 60 seconds | Root/log-filesystem free space, optional SMART/NVMe health summaries |
+
+Every row includes a schema version (`1`), timestamp with UTC offset, boot ID,
+monotonic time, uptime, source results, scheduling lag, and the preceding
+write-and-sync duration. Numeric units are in field names;
+NVIDIA fields retain its query names (memory in MiB, power in W, temperature in
+degrees C, clocks in MHz). CPU process percentages may exceed 100% for multiple
+cores. I/O represents physical-device counters, not partitions or loop devices.
+CPU power is average energy-counter change over the actual sample interval,
+including single counter wraparound; it is not whole-machine wall power.
+
+Source results carry `status`, collection time, age, and `data`. Startup and
+first-difference values can be null; failed, timed-out, exited, or stale sources
+are explicit. Sparse process/health payloads appear only when freshly collected;
+other rows still carry their status. Hardware `unreadable` lists failed sensor
+reads, absent sensors have no entries, and unsupported GPU values are null.
+Data from dead workers is unavailable until service restart. A stuck worker is
+not repeatedly replaced, preventing accumulation of blocked processes. The
+main writer has no dependency on the completion of any particular collector.
+
+Retention is configurable with `--retention-days N`, a positive integer. Cleanup
+runs at startup, date rollover, and hourly; it only removes recognized dated
+regular files older than the retained local dates. It does not follow symlinks
+or remove unrelated files. After a clock rollback, future-dated files remain
+until the calendar catches up, so the file count can temporarily exceed N.
+Restart appends to the current date and removes an incomplete trailing line,
+recording the number of recovered bytes. A lock prevents concurrent writers.
+Write or sync failures exit with an error; systemd retries after five seconds,
+with a five-starts-per-minute limit. After correcting a persistent failure, use
+`sudo systemctl reset-failed system-blackbox` and
+`sudo systemctl restart system-blackbox` in your terminal.
+
+Budget roughly **380–760 MiB/day, or 0.74–1.48 GiB for two days**; reserve at least
+2 GiB. This is an estimate, not a hard size limit. Device counts and process
+names affect the result. Files are uncompressed. `status` shows measured file
+sizes; a bounded trial can be extrapolated to 86,400 seconds. Journal storage is
+separate and is not included. Existing sysstat remains unchanged; atop is not
+required or recorded redundantly.
+
+`report` selects the latest retained boot other than the current boot, summarizes
+its final ten minutes (`--minutes` changes this), and reports temperature/power/
+load peaks, sampling gaps, source health and top processes. It queries existing
+journal messages for that boot and time window, including 60 seconds after the
+final sample, with up to 200 matching entries. Use `--boot-id BOOT_ID` to select a
+specific retained boot. Missing historical journal data is not proof that no
+error occurred. Inspect `journalctl --list-boots` separately; installation does
+not change global journald settings. No kernel logs are duplicated into JSONL.
+
+An abrupt log ending does not establish a PSU fault. Second-scale telemetry
+cannot capture millisecond supply transients or reliably distinguish a power
+interruption from hardware protection. These tools never change power limits,
+fans, or shutdown policy. Logs and reports can reveal workloads and must remain
+outside this public repository; do not commit real captures or local settings.
+
 ## commit_by_codex.sh
 
 Generates a commit message with Codex, then asks for confirmation unless `-y`

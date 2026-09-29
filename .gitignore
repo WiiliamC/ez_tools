@@ -1,2 +1,5 @@
 *.log
 logs/*.pid
+__pycache__/
+# Blackbox runtime data must stay outside Git.
+*.jsonl
