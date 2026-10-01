@@ -95,7 +95,7 @@ from pathlib import Path
 
 schema = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 prompt = sys.argv[2]
-assert set(schema["properties"]) == {"satisfied", "summary", "findings"}
+assert set(schema["properties"]) == {"review_completed", "satisfied", "summary", "findings"}
 items = schema["properties"]["findings"]["items"]
 assert items == {
     "type": "object",
@@ -115,6 +115,8 @@ for required in (
     "Priority meanings:",
     "Do not modify files or generate a PR fix",
     "Any qualifying P0-P3 finding makes satisfied false",
+    "An inability to verify findings is not approval",
+    "set review_completed=false, satisfied=false, and findings=[]",
     "do not add separate fields",
 ):
     assert required in prompt, f"Review invocation lost required guidance: {required}"
@@ -179,12 +181,14 @@ if [[ -n "${output_last_message}" ]]; then
     exit 2
   fi
 
-  if [[ -n "${FAKE_CODEX_REVIEW_RESPONSE:-}" ]]; then
+  if [[ "${FAKE_CODEX_SKIP_REVIEW_OUTPUT:-}" == "1" ]]; then
+    exit 0
+  elif [[ -n "${FAKE_CODEX_REVIEW_RESPONSE:-}" ]]; then
     printf '%s\n' "${FAKE_CODEX_REVIEW_RESPONSE}" >"${output_last_message}"
   elif [[ "${count}" -eq 1 ]]; then
-    printf '{"satisfied":false,"summary":"needs one fix","findings":[{"issue":"demo"}]}\n' >"${output_last_message}"
+    printf '{"review_completed":true,"satisfied":false,"summary":"needs one fix","findings":[{"issue":"demo"}]}\n' >"${output_last_message}"
   else
-    printf '{"satisfied":true,"summary":"clean","findings":[]}\n' >"${output_last_message}"
+    printf '{"review_completed":true,"satisfied":true,"summary":"clean","findings":[]}\n' >"${output_last_message}"
   fi
 else
   if [[ "${FAKE_CODEX_DELETE_REVIEW_DIR_ON_FIX:-}" == "1" ]]; then
@@ -326,7 +330,7 @@ fi
 # Private sidecars keep restrictive modes, while Codex inherits the caller's
 # normal umask and cannot pass the run lock to descendants.
 rm -f "${FAKE_CODEX_STATE}" "${FAKE_CODEX_UMASK_LOG}" "${FAKE_CODEX_FD9_LOG}"
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"clean","findings":[]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":true,"summary":"clean","findings":[]}'
 permission_log_dir="${tmp_dir}/permission-logs"
 (
   umask 027
@@ -359,7 +363,7 @@ done
 
 rm -f "${FAKE_CODEX_STATE}"
 : >"${FAKE_CODEX_ARGS_LOG}"
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"clean","findings":[]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":true,"summary":"clean","findings":[]}'
 "${script}" --repo "${test_repo}" --max-loops 1 --log-dir "${tmp_dir}/fast-logs" \
   --fast >/dev/null
 unset FAKE_CODEX_REVIEW_RESPONSE
@@ -372,7 +376,7 @@ if [[ "$(grep -c '^exec ' "${FAKE_CODEX_ARGS_LOG}")" -ne 1 ]] ||
 fi
 
 rm -f "${FAKE_CODEX_STATE}"
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":false,"summary":"still blocked","findings":[{"issue":"remaining issue"}]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":false,"summary":"still blocked","findings":[{"issue":"remaining issue"}]}'
 set +e
 max_loop_output="$("${script}" --repo "${test_repo}" --max-loops 1 \
   --log-dir "${tmp_dir}/max-loop-logs" 2>&1)"
@@ -396,7 +400,7 @@ if [[ "${max_loop_output}" == *"Modification prompt 1/1:"* ]]; then
 fi
 
 rm -f "${FAKE_CODEX_STATE}"
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":false,"summary":"safe\u001b[2J\nnext\u000dline","findings":[{"issue":"bell\u0007 and c1\u009b"}]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":false,"summary":"safe\u001b[2J\nnext\u000dline","findings":[{"issue":"bell\u0007 and c1\u009b"}]}'
 set +e
 control_output="$("${script}" --repo "${test_repo}" --max-loops 1 \
   --log-dir "${tmp_dir}/control-logs" 2>&1)"
@@ -418,7 +422,7 @@ if [[ "${control_status}" -ne 1 ]] ||
 fi
 
 rm -f "${FAKE_CODEX_STATE}" "${FAKE_CODEX_FIX_PROMPT}"
-export FAKE_CODEX_REVIEW_RESPONSE=$'{"satisfied":false,"summary":"raw c1 \u009b","findings":[{"issue":"remaining issue"}]}'
+export FAKE_CODEX_REVIEW_RESPONSE=$'{"review_completed":true,"satisfied":false,"summary":"raw c1 \u009b","findings":[{"issue":"remaining issue"}]}'
 set +e
 prompt_control_output="$("${script}" --repo "${test_repo}" --max-loops 2 \
   --log-dir "${tmp_dir}/prompt-control-logs" 2>&1)"
@@ -441,7 +445,7 @@ if [[ "$(cat "${FAKE_CODEX_FIX_PROMPT}")" != *$'raw c1 \u009b'* ]]; then
 fi
 
 rm -f "${FAKE_CODEX_STATE}" "${FAKE_CODEX_FIX_PROMPT}"
-export FAKE_CODEX_REVIEW_RESPONSE=$'{"satisfied":false,"summary":"中文摘要","findings":[{"issue":"中文问题和原始 C1 \u009b"}]}'
+export FAKE_CODEX_REVIEW_RESPONSE=$'{"review_completed":true,"satisfied":false,"summary":"中文摘要","findings":[{"issue":"中文问题和原始 C1 \u009b"}]}'
 set +e
 ascii_io_output="$(PYTHONIOENCODING=ascii \
   "${script}" --repo "${test_repo}" --max-loops 2 \
@@ -573,7 +577,7 @@ assert_state_root_rejected \
   -u XDG_STATE_HOME HOME=relative-home
 
 unique_state_dir="${tmp_dir}/unique-state"
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"clean","findings":[]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":true,"summary":"clean","findings":[]}'
 for _ in 1 2; do
   rm -f "${FAKE_CODEX_STATE}"
   XDG_STATE_HOME="${unique_state_dir}" \
@@ -627,16 +631,34 @@ assert_invalid_review_fails() {
 
 assert_invalid_review_fails \
   "false-empty" \
-  '{"satisfied":false,"summary":"contradictory","findings":[]}' \
+  '{"review_completed":true,"satisfied":false,"summary":"contradictory","findings":[]}' \
   "satisfied must be true exactly when findings is empty"
 assert_invalid_review_fails \
   "true-nonempty" \
-  '{"satisfied":true,"summary":"contradictory","findings":[{"issue":"demo"}]}' \
+  '{"review_completed":true,"satisfied":true,"summary":"contradictory","findings":[{"issue":"demo"}]}' \
   "satisfied must be true exactly when findings is empty"
 assert_invalid_review_fails \
   "extra-top-level-property" \
-  '{"satisfied":true,"summary":"clean","findings":[],"extra":"unexpected"}' \
-  "top-level object must contain exactly satisfied, summary, and findings"
+  '{"review_completed":true,"satisfied":true,"summary":"clean","findings":[],"extra":"unexpected"}' \
+  "top-level object must contain exactly review_completed, satisfied, summary, and findings"
+
+# Original failure: an unperformed review must not be accepted as approval.
+assert_invalid_review_fails \
+  "original-sandbox-failure" \
+  '{"satisfied":true,"summary":"Review could not be completed: sandbox initialization failed before Git commands ran, and alternative file access required unavailable approval. No findings could be verified; this is not approval of the changes. Please provide Git status, staged and unstaged diffs, and relevant untracked files, or rerun with working read access.","findings":[]}' \
+  "top-level object must contain exactly review_completed, satisfied, summary, and findings"
+assert_invalid_review_fails \
+  "completion-wrong-type" \
+  '{"review_completed":"true","satisfied":true,"summary":"clean","findings":[]}' \
+  "review_completed must be a boolean"
+assert_invalid_review_fails \
+  "incomplete-approved" \
+  '{"review_completed":false,"satisfied":true,"summary":"blocked","findings":[]}' \
+  "incomplete review requires satisfied=false and empty findings"
+assert_invalid_review_fails \
+  "incomplete-findings" \
+  '{"review_completed":false,"satisfied":false,"summary":"blocked","findings":[{"issue":"unverified"}]}' \
+  "incomplete review requires satisfied=false and empty findings"
 
 json_field() {
   python3 - "$1" "$2" <<'PY'
@@ -679,7 +701,7 @@ if [[ "${timeout_status}" -ne 124 ]] ||
     "${timeout_output}" >&2
   exit 1
 fi
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"timeout resumed","findings":[]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":true,"summary":"timeout resumed","findings":[]}'
 timeout_resume_output="$("${script}" --resume "${timeout_log}")"
 unset FAKE_CODEX_REVIEW_RESPONSE
 if [[ "${timeout_resume_output}" != *"Review passed on loop 1"* ]] ||
@@ -691,7 +713,7 @@ fi
 
 reset_fake_codex
 export FAKE_CODEX_TIMEOUT_EVENT=1 FAKE_CODEX_TIMEOUT_FALSE_POSITIVES=1
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"not a timeout","findings":[]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":true,"summary":"not a timeout","findings":[]}'
 false_positive_output="$("${script}" --repo "${test_repo}" --max-loops 1 --log-dir "${tmp_dir}/false-positive-logs" 2>&1)"
 unset FAKE_CODEX_TIMEOUT_EVENT FAKE_CODEX_TIMEOUT_FALSE_POSITIVES FAKE_CODEX_REVIEW_RESPONSE
 if [[ "${false_positive_output}" != *"Review passed on loop 1"* ]] ||
@@ -774,7 +796,7 @@ if [[ "${review_fail_status}" -ne 7 ]] ||
   echo "Expected failed review to preserve a resumable session" >&2
   exit 1
 fi
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"resumed clean","findings":[]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":true,"summary":"resumed clean","findings":[]}'
 review_resume_output="$("${script}" --resume "${review_resume_log}")"
 unset FAKE_CODEX_REVIEW_RESPONSE
 if [[ "${review_resume_output}" != *"Review passed on loop 1"* ]] ||
@@ -848,7 +870,7 @@ if [[ "${drift_status}" -ne 2 ]] || [[ "${drift_output}" != *"--allow-worktree-c
   printf 'Expected worktree drift rejection. Output:\n%s\n' "${drift_output}" >&2
   exit 1
 fi
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"accepted drift","findings":[]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":true,"summary":"accepted drift","findings":[]}'
 "${script}" --resume "${drift_log}" --allow-worktree-changes >/dev/null
 unset FAKE_CODEX_REVIEW_RESPONSE
 git -C "${test_repo}" checkout -q -- README.md
@@ -928,7 +950,7 @@ fi
 
 # An exhausted run requires a larger total, then continues from its completed review.
 reset_fake_codex
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":false,"summary":"extend me","findings":[{"issue":"more work"}]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":false,"summary":"extend me","findings":[{"issue":"more work"}]}'
 extension_dir="${tmp_dir}/extension-logs"
 set +e
 "${script}" --repo "${test_repo}" --max-loops 1 --log-dir "${extension_dir}" >/dev/null 2>&1
@@ -973,7 +995,7 @@ state = max(states, key=lambda p: (json.loads(p.read_text())["updated_at"], p.st
 print(str(state)[:-len(".state.json")])
 PY
 )"
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"newest","findings":[]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":true,"summary":"newest","findings":[]}'
 latest_output="$("${script}" --repo "${test_repo}" --log-dir "${latest_dir}" --resume)"
 unset FAKE_CODEX_REVIEW_RESPONSE
 if [[ "${latest_output}" != *"Resuming review/fix log: ${latest_log}"* ]]; then
@@ -1012,7 +1034,7 @@ source.with_name("bad-updated-at.log.state.json").write_text(
     json.dumps(bad_updated_at) + "\n", encoding="utf-8"
 )
 PY
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"valid resumed","findings":[]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":true,"summary":"valid resumed","findings":[]}'
 corrupt_output="$("${script}" --repo "${test_repo}" --log-dir "${corrupt_dir}" \
   --resume --max-loops 3)"
 unset FAKE_CODEX_REVIEW_RESPONSE
@@ -1031,12 +1053,12 @@ set +e
 set -e
 unset FAKE_CODEX_FAIL_ON_CALL
 mixed_interrupted_log="$(find "${mixed_latest_dir}" -name '*.log' -print -quit)"
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":false,"summary":"exhausted","findings":[{"issue":"later"}]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":false,"summary":"exhausted","findings":[{"issue":"later"}]}'
 set +e
 "${script}" --repo "${test_repo}" --max-loops 1 --log-dir "${mixed_latest_dir}" >/dev/null 2>&1
 set -e
 unset FAKE_CODEX_REVIEW_RESPONSE
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"older resumed","findings":[]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":true,"summary":"older resumed","findings":[]}'
 mixed_latest_output="$("${script}" --repo "${test_repo}" --log-dir "${mixed_latest_dir}" --resume)"
 unset FAKE_CODEX_REVIEW_RESPONSE
 if [[ "${mixed_latest_output}" != *"Resuming review/fix log: ${mixed_interrupted_log}"* ]]; then
@@ -1092,7 +1114,7 @@ if [[ "${stale_status}" -ne 2 ]] || [[ "${stale_output}" != *"trustworthy saved 
   printf 'Expected stale running state to require an override. Output:\n%s\n' "${stale_output}" >&2
   exit 1
 fi
-export FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"stale resumed","findings":[]}'
+export FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":true,"summary":"stale resumed","findings":[]}'
 "${script}" --resume "${remaining_latest_log}" --allow-worktree-changes >/dev/null
 unset FAKE_CODEX_REVIEW_RESPONSE
 
@@ -1187,7 +1209,7 @@ scratch.mkdir()
 env = dict(os.environ, TMPDIR=str(scratch), COMMIT_CALL=str(commit_call),
            FAKE_CODEX_STATE=str(root / 'wrapper-codex-state'),
            FAKE_CODEX_PROCESS_LOG=str(root / 'wrapper-processes'),
-           FAKE_CODEX_REVIEW_RESPONSE='{"satisfied":true,"summary":"clean","findings":[]}')
+           FAKE_CODEX_REVIEW_RESPONSE='{"review_completed":true,"satisfied":true,"summary":"clean","findings":[]}')
 env.pop('REVIEW_UNTIL_RESULT_FILE', None)
 
 def run(entry, args, cwd=root, **overrides):
@@ -1213,6 +1235,65 @@ assert result.returncode == 2 and not report.exists()
 result = run(wrapper, ['--log-dir', root / 'wrapper-fresh-logs'], cwd=repo)
 assert result.returncode == 0, result.stderr
 assert json.loads(commit_call.read_text()) == ['--repo', str(repo), '-y']
+
+# Exercise fail-closed behavior through the real review and outer wrapper.
+clean = env['FAKE_CODEX_REVIEW_RESPONSE']
+incomplete = json.dumps(dict(review_completed=False, satisfied=False,
+                             summary='sandbox initialization failed', findings=[]))
+legacy = json.dumps(dict(satisfied=True, summary='Review could not be completed; this is not approval.',
+                         findings=[]))
+for name, response in [('incomplete', incomplete), ('legacy', legacy),
+                       ('contradictory', json.dumps(dict(review_completed=False, satisfied=True,
+                                                        summary='blocked', findings=[])))]:
+    Path(env['FAKE_CODEX_STATE']).unlink(missing_ok=True)
+    logs = root / ('wrapper-blocked-' + name)
+    result = run(wrapper, ['--repo', repo, '--log-dir', logs],
+                 FAKE_CODEX_REVIEW_RESPONSE=response)
+    assert result.returncode == 2 and not commit_call.exists(), result
+    assert Path(env['FAKE_CODEX_STATE']).read_text() == '1', 'Unexpected retry or fix'
+    log, = logs.glob('*.log')
+    checkpoint = json.loads(Path(str(log) + '.state.json').read_text())
+    assert (checkpoint['phase'], checkpoint['phase_status'], checkpoint['run_status'],
+            checkpoint['loop']) == ('review', 'failed', 'resumable', 1), checkpoint
+    if name == 'incomplete':
+        assert b'Status: incomplete' in result.stdout
+        assert b'Review passed' not in result.stdout
+    # Same loop must run a fresh review and only then permit commit.
+    result = run(wrapper, ['--resume', log], FAKE_CODEX_REVIEW_RESPONSE=clean)
+    assert result.returncode == 0 and commit_call.exists(), result
+    assert Path(env['FAKE_CODEX_STATE']).read_text() == '2', 'Review was not rerun'
+
+# A standalone incomplete review must never produce the success handoff file.
+report = root / 'blocked-review-result'
+result = run(review, ['--repo', repo, '--log-dir', root / 'blocked-result-logs'],
+             REVIEW_UNTIL_RESULT_FILE=str(report), FAKE_CODEX_REVIEW_RESPONSE=incomplete)
+assert result.returncode == 2 and not report.exists(), result
+
+# Legacy completed checkpoints must be re-reviewed rather than consumed as approval.
+# Failed invocations must not reuse stale valid review output either.
+for mode in ('legacy-completed', 'stale-output'):
+    Path(env['FAKE_CODEX_STATE']).unlink(missing_ok=True)
+    logs = root / ('wrapper-' + mode)
+    result = run(wrapper, ['--repo', repo, '--log-dir', logs], FAKE_CODEX_FAIL_ON_CALL='1')
+    assert result.returncode == 7 and not commit_call.exists(), result
+    log, = logs.glob('*.log')
+    saved_review = Path(str(log) + '.review.json')
+    checkpoint_path = Path(str(log) + '.state.json')
+    if mode == 'legacy-completed':
+        saved_review.write_text(legacy)
+        checkpoint = json.loads(checkpoint_path.read_text())
+        checkpoint.update(phase_status='completed', session_id='')
+        checkpoint_path.write_text(json.dumps(checkpoint))
+        result = run(wrapper, ['--resume', log], FAKE_CODEX_REVIEW_RESPONSE=incomplete)
+    else:
+        saved_review.write_text(clean)
+        result = run(wrapper, ['--resume', log], FAKE_CODEX_SKIP_REVIEW_OUTPUT='1')
+        assert saved_review.read_text() == '', 'Stale review was not cleared'
+    assert result.returncode == 2 and not commit_call.exists(), result
+    assert Path(env['FAKE_CODEX_STATE']).read_text() == '2', 'Review was not rerun'
+    result = run(wrapper, ['--resume', log])
+    assert result.returncode == 0 and commit_call.exists(), result
+    assert Path(env['FAKE_CODEX_STATE']).read_text() == '3'
 
 for mode in ('explicit', 'equals', 'bare', 'drift'):
     Path(env['FAKE_CODEX_STATE']).unlink(missing_ok=True)

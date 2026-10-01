@@ -121,10 +121,12 @@ schema_errors = []
 if not isinstance(review, dict):
     schema_errors.append("top-level value is not an object")
 else:
-    if set(review) != {"satisfied", "summary", "findings"}:
+    if set(review) != {"review_completed", "satisfied", "summary", "findings"}:
         schema_errors.append(
-            "top-level object must contain exactly satisfied, summary, and findings"
+            "top-level object must contain exactly review_completed, satisfied, summary, and findings"
         )
+    if not isinstance(review.get("review_completed"), bool):
+        schema_errors.append("review_completed must be a boolean")
     if not isinstance(review.get("satisfied"), bool):
         schema_errors.append("satisfied must be a boolean")
     if not isinstance(review.get("summary"), str):
@@ -152,7 +154,12 @@ satisfied = review.get("satisfied") is True
 findings = review.get("findings")
 findings_empty = isinstance(findings, list) and len(findings) == 0
 
-if satisfied and findings_empty:
+if not review["review_completed"]:
+    if satisfied or not findings_empty:
+        print("Review JSON is inconsistent: incomplete review requires satisfied=false and empty findings", file=sys.stderr)
+        sys.exit(2)
+    print("incomplete")
+elif satisfied and findings_empty:
     print("pass")
 elif not satisfied and not findings_empty:
     print("fail")
@@ -187,7 +194,10 @@ def terminal_safe(text):
     )
 
 print(f"Review feedback {loop}/{max_loops}:")
-print(f"  Status: {'satisfied' if review['satisfied'] else 'changes requested'}")
+status = "incomplete" if not review["review_completed"] else (
+    "satisfied" if review["satisfied"] else "changes requested"
+)
+print(f"  Status: {status}")
 print("  Summary:")
 summary_lines = terminal_safe(review["summary"]).split("\n")
 for line in summary_lines:
@@ -673,6 +683,9 @@ cat > "$schema_file" <<'JSON'
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "review_completed": {
+      "type": "boolean"
+    },
     "satisfied": {
       "type": "boolean"
     },
@@ -696,6 +709,7 @@ cat > "$schema_file" <<'JSON'
     }
   },
   "required": [
+    "review_completed",
     "satisfied",
     "summary",
     "findings"
@@ -710,7 +724,7 @@ umask "$caller_umask"
 # Adapted from OpenAI Codex review guidelines; synced 2026-09-15.
 # https://github.com/openai/codex/blob/a8964cb1bad67bc26a826fb07d1bef99c6a3f008/codex-rs/prompts/templates/review/rubric.md
 # Keep review criteria aligned with this pinned source. Output instructions are
-# adapted to our existing satisfied/summary/findings[].issue protocol.
+# adapted to our review_completed/satisfied/summary/findings[].issue protocol.
 review_prompt="$(cat <<'PROMPT'
 Review the current uncommitted changes in this repository. Inspect git status, staged and unstaged diffs, and relevant untracked files before deciding.
 
@@ -756,6 +770,7 @@ This is a review-only phase. Do not modify files or generate a PR fix.
 
 Return a structured final JSON message that matches the provided output schema:
 {
+  "review_completed": boolean,
   "satisfied": boolean,
   "summary": string,
   "findings": [
@@ -765,7 +780,7 @@ Return a structured final JSON message that matches the provided output schema:
   ]
 }
 
-Set satisfied to true exactly when there are no qualifying findings under the review guidelines above, and in that case return an empty findings array. Any qualifying P0-P3 finding makes satisfied false. When unsatisfied, include one or more findings, each as an object with only an issue string. Put the priority, location, explanation, and any rule reference inside that string; do not add separate fields for them. Use summary for a brief explanation of the review result. Do not wrap the JSON in Markdown fences or extra prose.
+Set review_completed to true only after successfully inspecting git status, staged and unstaged diffs, and relevant untracked files and completing the review. If sandbox initialization, permissions, tools, or any other obstacle prevents completing that inspection, set review_completed=false, satisfied=false, and findings=[]; explain the obstacle in summary. An inability to verify findings is not approval. For a completed review, set satisfied to true exactly when there are no qualifying findings under the review guidelines above, and in that case return an empty findings array. Any qualifying P0-P3 finding makes satisfied false. When a completed review is unsatisfied, include one or more findings, each as an object with only an issue string. Put the priority, location, explanation, and any rule reference inside that string; do not add separate fields for them. Use summary for a brief explanation of the review result. Do not wrap the JSON in Markdown fences or extra prose.
 PROMPT
 )"
 
@@ -857,6 +872,14 @@ if [ "$resuming" = true ]; then
         [ -z "$session_id" ]; then
         error "A partially completed Fix has no captured session and cannot be rerun automatically."
         exit 2
+    fi
+    # Old completed review checkpoints do not establish review completion.
+    # Re-execute invalid saved results under the current protocol.
+    if [ "$phase" = review ] && [ "$phase_status" = completed ] &&
+        ! parse_review_status "$review_json" >/dev/null 2>> "$log_file"; then
+        phase_status=pending
+        session_id=""
+        echo "Saved review result is invalid under the current protocol; rerunning review." >> "$log_file"
     fi
     worktree_fingerprint_value="$current_fingerprint"
     fingerprint_trustworthy=true
@@ -1020,6 +1043,7 @@ while [ "$loop" -le "$max_loops" ]; do
                 date '+Started: %Y-%m-%d %H:%M:%S'
             } >> "$log_file"
             terminal_tab_spinner_start "$project_name" "Reviewing ${loop}/${max_loops}"
+            : > "$review_json"
             if run_codex_phase "$review_prompt"; then status=0; else status=$?; fi
             terminal_tab_spinner_stop
             new_session_id="$(extract_session_id "${tmp_dir}/invocation.events.jsonl")"
@@ -1060,6 +1084,15 @@ while [ "$loop" -le "$max_loops" ]; do
         fi
         print_review_feedback "$review_json" "$loop" "$max_loops"
         echo ""
+        if [ "$review_status" = incomplete ]; then
+            phase_status=failed
+            run_status=resumable
+            session_id=""
+            write_state
+            echo "Review incomplete; stopping without fix or commit." >> "$log_file"
+            error "Review could not be completed. Fix the environment and use --resume. See log: ${log_file}"
+            exit 2
+        fi
         if [ "$review_status" = pass ]; then
             run_status=passed
             phase_status=completed

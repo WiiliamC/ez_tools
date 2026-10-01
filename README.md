@@ -605,20 +605,29 @@ synced on 2026-09-15. This is a custom review workflow, not the built-in `/revie
 command. The guidelines require actionable bugs introduced by the changes,
 supported by evidence, with standards appropriate to the repository.
 
-The existing JSON protocol remains `satisfied`, `summary`, and
-`findings: [{"issue": "..."}]`. Each issue includes a P0-P3 priority, file and line
+The review JSON protocol requires `review_completed`, `satisfied`, `summary`,
+and `findings: [{"issue": "..."}]`. Each issue includes a P0-P3 priority, file and line
 location, trigger conditions, and impact; findings based on project-specific
 rules also cite their source. Separate official priority, location, confidence,
 and overall-correctness fields are not used. Any qualifying finding, including
-P3, requests another fix; satisfaction requires an empty findings array.
+P3, requests another fix. Passing requires `review_completed=true`,
+`satisfied=true`, and an empty findings array. If sandbox initialization,
+permissions, or tool failures prevent completing the review, the reviewer must
+return `review_completed=false`, `satisfied=false`, and empty findings, with the
+obstacle in the summary. The script exits with status `2`, without fixing or
+committing; repair the environment and use `--resume` to rerun that review.
+Invalid or contradictory output also stops the workflow. There is no automatic
+retry or permission escalation.
 
 The prompt is embedded in the script and requires no runtime download. To update
 it manually, compare the pinned upstream rubric with a new upstream commit,
-adapt its review criteria while keeping only the existing output protocol, and
+adapt its review criteria while keeping the output protocol above, and
 update the source commit and sync date in the script and this section. Run the
 review loop and review-and-commit tests after updating. On resume, reviews that
-need execution receive the current prompt; completed saved results are consumed
-as before.
+need execution receive the current prompt; valid completed saved results are consumed
+as before. Older completed review results missing `review_completed` must be
+reviewed again. Existing fix checkpoints retain their resume behavior, and
+already passed runs remain non-resumable.
 
 ```bash
 ./review_untill_satisfied.sh --repo ../my-project/
