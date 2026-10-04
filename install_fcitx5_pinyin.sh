@@ -16,6 +16,7 @@ Usage: ./install_fcitx5_pinyin.sh [install|configure|status|help] [--yes]
 Install Fcitx5 with Rime Ice (full Pinyin) on Ubuntu/Debian APT systems.
 Selects Mellow Vermilion and sets candidate font size to 1.6 times its initial size.
 install and configure set Fcitx5 as the current user default input framework.
+They also enable input method activation by default on startup.
 Log out and back in for applications to inherit the input framework setting.
 Comma/period turn candidate pages in Rime Ice. Existing input methods are retained.
 Running install again updates Rime Ice and Mellow.
@@ -164,6 +165,15 @@ try:
 except (OSError, ValueError, TypeError) as error:
     sys.exit("Cannot prepare candidate font: " + str(error))
 PYFONT
+}
+
+configured_activation() {
+  local value
+  value="$(awk '
+    /^\[/ { inside = ($0 == "[Behavior]") }
+    inside && /^ActiveByDefault=/ { sub(/^ActiveByDefault=/, ""); print; exit }
+  ' "$CONFIG_DIR/config" 2>/dev/null || true)"
+  printf '%s\n' "${value:-False (default; not configured)}"
 }
 
 create_or_merge_profile() {
@@ -557,7 +567,7 @@ bus_owned() {
 apply_session() (
   local stage="${1:-}" manifest="${2:-}" custom_before="${3:-}" theme_stage="${4:-}" file relative answer bus_state
   local desktop=False stopped=False phase=prepare snapshot deadline group live_group live_im candidate_font
-  local -a managed=("$CONFIG_DIR/profile" "$CONFIG_DIR/conf/classicui.conf" "$CONFIG_DIR/candidate-font.json"
+  local -a managed=("$CONFIG_DIR/profile" "$CONFIG_DIR/config" "$CONFIG_DIR/conf/classicui.conf" "$CONFIG_DIR/candidate-font.json"
     "$RIME_DATA_DIR/user.yaml" "$RIME_DATA_DIR/default.custom.yaml" "$RIME_DATA_DIR/rime_ice.custom.yaml" "$RIME_DATA_DIR/build/rime_ice.schema.yaml" "$HOME/.xinputrc")
   for file in timeout dbus-send pgrep fcitx5-remote fcitx5 rime_deployer im-config /usr/bin/python3; do need_cmd "$file"; done
   snapshot="$(mktemp -d)"
@@ -674,6 +684,8 @@ apply_session() (
   fi
   im-config -n fcitx5
   create_or_merge_profile
+  # DefaultIM selects the engine; activation at startup is a separate setting.
+  upsert_keys "$CONFIG_DIR/config" Behavior ActiveByDefault True
   # Select the managed theme and stable scaled font, preserving other settings.
   if [[ ! -f "$CONFIG_DIR/conf/classicui.conf" ]]; then
     upsert_keys "$CONFIG_DIR/conf/classicui.conf" \
@@ -684,6 +696,7 @@ apply_session() (
   fi
   upsert_keys "$CONFIG_DIR/conf/classicui.conf" '' Font "$candidate_font"
   replace_if_changed "$CONFIG_DIR/candidate-font.json" "$snapshot/candidate-font.json"
+  [[ "$(configured_activation)" == True ]] || die 'default input method activation was not saved'
   log 'Fcitx5 is configured as the current user default; log out and back in for applications to inherit this setting.'
   if [[ "$desktop" != True ]]; then
     phase=complete
@@ -772,6 +785,7 @@ show_status() {
   log "im-config: $im_status"
   log "old Pinyin cloud settings: $cloud_status"
   log "configured defaults: $(grep '^DefaultIM=' "${CONFIG_DIR}/profile" 2>/dev/null | tr '\n' ' ' || true)"
+  log "configured activation by default: $(configured_activation)"
   if [[ -f "${RIME_DATA_DIR}/.rime-ice-version" ]]; then
     log "Rime Ice revision: $(cat "${RIME_DATA_DIR}/.rime-ice-version")"
   else

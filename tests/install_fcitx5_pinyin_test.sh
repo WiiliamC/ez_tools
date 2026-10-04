@@ -141,6 +141,9 @@ case "$1" in
     if [[ -f "$HOME/exit-profile" ]]; then
       cp "$HOME/exit-profile" "$XDG_CONFIG_HOME/fcitx5/profile"
     fi
+    if [[ -f "$HOME/exit-config" ]]; then
+      cp "$HOME/exit-config" "$XDG_CONFIG_HOME/fcitx5/config"
+    fi
     [[ "${STUB_EXIT_TIMEOUT:-0}" == 0 ]] || exit 0
     rm -f "$HOME/running" ;;
   --check) [[ -f "$HOME/running" ]] ;;
@@ -274,6 +277,8 @@ assert_contains "$profile" 'Name=keyboard-us'
 assert_contains "$profile" '[Groups/0/Items/1]'
 assert_contains "$profile" 'Name=rime'
 assert_contains "$profile" 'DefaultIM=rime'
+assert_contains "$fresh_home/.config/fcitx5/config" '[Behavior]'
+assert_contains "$fresh_home/.config/fcitx5/config" 'ActiveByDefault=True'
 [[ "$(cat "${fresh_home}/apt.calls")" == *'fcitx5-rime librime-plugin-lua librime-bin git'* ]] || fail 'missing Rime dependencies'
 assert_contains "${fresh_home}/.local/share/fcitx5/rime/user.yaml" 'previously_selected_schema: rime_ice'
 [[ ! -e "${fresh_home}/.config/fcitx5/conf/pinyin.conf" ]] || fail 'fresh install configured old Pinyin'
@@ -473,6 +478,15 @@ Layout=
 Keep=latest
 EOF
 session_config="$session_home/.config/fcitx5"
+cat >"$session_home/exit-config" <<'EOF'
+[Behavior]
+ActiveByDefault=False
+ShareInputState=Program
+
+[Hotkey]
+EnumerateSkipFirst=True
+EOF
+printf '[Behavior]\nActiveByDefault=False\nShareInputState=No\n' >"$session_config/config"
 printf 'Theme=CustomTheme\nFont=Example 12\n' >"$session_config/conf/classicui.conf"
 run_configure() {
   HOME="$session_home" XDG_CONFIG_HOME="$session_home/.config" PATH="$stub_bin:$PATH" DISPLAY=:99 \
@@ -485,6 +499,16 @@ deploy_before="$(cat "$session_home/deploy.calls")"
 run_configure --yes >/dev/null
 assert_contains "$session_config/profile" 'DefaultIM=rime'
 assert_contains "$session_config/profile" 'Keep=latest'
+assert_contains "$session_config/config" 'ActiveByDefault=True'
+assert_contains "$session_config/config" 'ShareInputState=Program'
+assert_contains "$session_config/config" 'EnumerateSkipFirst=True'
+found_config_backup=0
+for backup in "$session_config"/config.bak.*; do
+  if cmp -s "$backup" "$session_home/exit-config"; then found_config_backup=1; fi
+done
+[[ "$found_config_backup" == 1 ]] || fail 'global config backup was not taken after exit save'
+# Further exits should preserve the newly saved activation setting.
+cp "$session_config/config" "$session_home/exit-config"
 assert_contains "$session_config/conf/classicui.conf" 'Theme=mellow-vermilion'
 assert_contains "$session_config/conf/classicui.conf" 'Font=Sans 16'
 [[ "$(wc -l <"$session_home/im-config.calls")" == "$((im_calls_before + 1))" ]] || fail 'configure did not set default framework'
@@ -578,6 +602,7 @@ cat >"$stub_bin/mv" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${STUB_WRITE_FAIL:-0}" == 1 && "${@: -1}" == */profile ]]; then exit 1; fi
 if [[ "${STUB_FONT_STATE_FAIL:-0}" == 1 && "${@: -1}" == */candidate-font.json ]]; then exit 1; fi
+if [[ "${STUB_CONFIG_WRITE_FAIL:-0}" == 1 && "${@: -1}" == */fcitx5/config ]]; then exit 1; fi
 exec /usr/bin/mv "$@"
 EOF
 chmod +x "$stub_bin/mv"
@@ -722,6 +747,45 @@ fi
 assert_contains "$session_home/.xinputrc" 'framework=previous'
 assert_contains "$session_config/conf/classicui.conf" 'Font=Example 12'
 [[ ! -e "$session_config/candidate-font.json" ]] || fail 'failed write left a baseline'
+# Global configuration participates in rollback, both before and after its write.
+for initial in absent disabled missing_key; do
+  case "$initial" in
+    absent) rm -f "$session_config/config" ;;
+    disabled) printf '[Behavior]\nActiveByDefault=False\nShareInputState=Program\n' >"$session_config/config" ;;
+    missing_key) printf '[Behavior]\nShareInputState=Program\n' >"$session_config/config" ;;
+  esac
+  if [[ -f "$session_config/config" ]]; then cp "$session_config/config" "$tmp_dir/activation-before"; fi
+  status="$(HOME="$session_home" XDG_CONFIG_HOME="$session_home/.config" PATH="$stub_bin:$PATH" bash "$script" status)"
+  if [[ "$initial" == disabled ]]; then
+    [[ "$status" == *'configured activation by default: False'* ]] || fail 'disabled activation status missing'
+    [[ "$status" != *'False (default; not configured)'* ]] || fail 'explicit False reported as missing'
+  else
+    [[ "$status" == *'configured activation by default: False (default; not configured)'* ]] || fail 'missing activation default not reported'
+  fi
+  for failure in STUB_CONFIG_WRITE_FAIL STUB_FONT_STATE_FAIL; do
+    if (export "$failure=1"; HOME="$session_home" XDG_CONFIG_HOME="$session_home/.config" PATH="$stub_bin:$PATH" bash "$script" configure) >"$tmp_dir/activation-error" 2>&1; then
+      fail "$failure accepted"
+    fi
+    if [[ "$initial" == absent ]]; then
+      [[ ! -e "$session_config/config" ]] || fail 'rollback left a new global config'
+    else
+      cmp -s "$session_config/config" "$tmp_dir/activation-before" || fail 'rollback changed global config'
+    fi
+  done
+  output="$(HOME="$session_home" XDG_CONFIG_HOME="$session_home/.config" PATH="$stub_bin:$PATH" bash "$script" configure)"
+  [[ "$output" == *'activation is pending login'* ]] || fail 'offline activation not reported as pending'
+  assert_contains "$session_config/config" 'ActiveByDefault=True'
+  if [[ "$initial" != absent ]]; then assert_contains "$session_config/config" 'ShareInputState=Program'; fi
+  before="$(find "$session_config" -type f -exec sha256sum {} + | sort)"
+  HOME="$session_home" XDG_CONFIG_HOME="$session_home/.config" PATH="$stub_bin:$PATH" bash "$script" configure >/dev/null
+  [[ "$before" == "$(find "$session_config" -type f -exec sha256sum {} + | sort)" ]] || fail 'repeat configure changed config or backups'
+  status="$(HOME="$session_home" XDG_CONFIG_HOME="$session_home/.config" PATH="$stub_bin:$PATH" bash "$script" status)"
+  [[ "$status" == *'configured activation by default: True'* ]] || fail 'enabled activation status missing'
+  # Keep the next font-state failure meaningful.
+  rm -f "$session_config/candidate-font.json"
+  printf 'Font=Example 12\n' >"$session_config/conf/classicui.conf"
+done
+printf 'framework=previous\n' >"$session_home/.xinputrc"
 if STUB_FONT_STATE_FAIL=1 HOME="$session_home" XDG_CONFIG_HOME="$session_home/.config" PATH="$stub_bin:$PATH" bash "$script" configure >"$tmp_dir/font-error" 2>&1; then
   fail 'font state write failure accepted'
 fi

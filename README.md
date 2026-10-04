@@ -355,9 +355,15 @@ windows must still be closed. Without a desktop session, the script writes the
 configuration only after checking that Fcitx5 is stopped, and reports activation
 as pending login. Both `install` and `configure` set Fcitx5 as the current
 user's default input framework using `im-config`, and select Rime Ice.
+They also set `[Behavior] ActiveByDefault=True` in the Fcitx5 global configuration,
+so input starts active after login instead of requiring an initial toggle from
+English. This setting is backed up and restored on configuration write failure;
+other global settings and manual switching remain available.
 Log out and back in so applications inherit the framework setting.
 Run `status` after login and verify typing and the Rime Ice
-schema in the desktop UI.
+schema in the desktop UI, including typing in a newly focused ordinary text field
+and manually switching back to English. `status` reports the configured default
+activation separately from the live input method.
 
 Run `install` again to update Rime Ice and Mellow upstream resources.
 Only Mellow's Vermilion theme and its license are installed, under
