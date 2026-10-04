@@ -2,6 +2,17 @@
 
 A collection of utility tools for Linux systems.
 
+## chatgpt_proxy.sh
+
+Launch `chatgpt` with an HTTP proxy on localhost. The optional first argument
+sets the port (default: `7890`); remaining arguments are passed to `chatgpt`.
+
+```bash
+./chatgpt_proxy.sh              # Default port 7890
+./chatgpt_proxy.sh 8080         # Custom port
+./chatgpt_proxy.sh 8080 --help  # Pass an argument to chatgpt
+```
+
 ## system_blackbox.py / system_blackbox.sh
 
 Records Linux system activity for investigating abrupt shutdowns. Uses Python 3
