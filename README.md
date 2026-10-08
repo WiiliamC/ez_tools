@@ -994,3 +994,35 @@ Unattended-Upgrade::Package-Blacklist { "linux-"; };
 This blocks unattended upgrades for packages matching `linux-` without disabling the system's overall security updates. `enable` removes only that managed file and leaves any other user-managed APT configuration unchanged. `status` reports whether the effective `Unattended-Upgrade::Package-Blacklist` contains `linux-`, and whether it was detected in the managed file or in non-managed APT configuration.
 
 Requires `sudo` for `disable` and `enable` when not run as root.
+
+## install_agent_reach_douyin.sh
+
+Installs or reuses Agent Reach and OpenCLI for Douyin search, then adds a managed Douyin routing section to the Agent Reach skill while preserving custom skill content. Uses user-local paths only; it does not install system dependencies or edit shell profiles.
+
+```bash
+./install_agent_reach_douyin.sh          # default: install
+./install_agent_reach_douyin.sh install
+./install_agent_reach_douyin.sh check
+./install_agent_reach_douyin.sh check --query "keyword"
+./install_agent_reach_douyin.sh help
+```
+
+Requires Node.js >=20.18.1; installing Agent Reach requires Python >=3.10 with `venv`, and installing OpenCLI requires `npm`. Python is also used to update the skill and validate search results. Existing working tools are reused; repeat runs do not implicitly upgrade them. Missing Agent Reach is installed from its [official source archive](https://github.com/Panniantong/agent-reach/archive/main.zip) into `~/.agent-reach-venv`; missing OpenCLI is installed as `@jackwener/opencli` under `~/.agent-reach/tools/opencli`. Managed tools receive wrappers in `~/.local/bin`; unrelated same-name entries are rejected. If necessary, add wrappers to your current shell:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+The official Agent Reach skill is registered in an isolated temporary HOME only when `~/.agents/skills/agent-reach/SKILL.md` is missing. Its missing files are copied into that target without replacing custom files or other clients' skills. Repeated installs update only the marked Douyin routing section.
+
+Install and enable the [official OpenCLI Chrome extension](https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk), keep Chrome running, open [Douyin](https://www.douyin.com/), and log in manually in that browser. The extension daemon starts on demand; no cookie export is needed. Software installation alone does not verify search access. `check` validates binaries, the Douyin adapter, and `opencli doctor` connectivity; `check --query` additionally performs a real search and requires nonempty valid JSON with usable video results. Bridge, authentication, timeout, empty-result, and invalid-output failures return nonzero with diagnostics. Agent Reach doctor does not include a Douyin channel, and unrelated channel failures do not need to pass.
+
+For direct search and adapter discovery:
+
+```bash
+opencli list
+opencli douyin search --help
+opencli douyin search "keyword" --limit 10 -f json
+```
+
+`--limit` supports 1..30. Search plays, comments, and shares are placeholder zeros, not measured metrics.
