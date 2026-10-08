@@ -8,19 +8,35 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=terminal_tab_spinner.sh
 source "${script_dir}/terminal_tab_spinner.sh"
 
+# This file is sourced by the two public entrypoints.
+if [[ "${review_until_workflow:-}" != changes && "${review_until_workflow:-}" != pr ]]; then
+    echo "Error: use review_changes_untill_satisfied.sh or review_pr_untill_satisfied.sh." >&2
+    exit 2
+fi
+script_name="review_${review_until_workflow}_untill_satisfied.sh"
+state_namespace="${script_name%.sh}"
+base_branch=""
+base_commit=""
+merge_base=""
+
 DEFAULT_MAX_LOOPS=12
 exec_datetime="$(date '+%Y%m%d_%H%M%S')"
 
 usage() {
-    echo "Usage: bash scripts/review_untill_satisfied.sh [OPTIONS]"
+    echo "Usage: ${script_name} [OPTIONS]"
     echo ""
     echo "Run Codex review/fix cycles until review is satisfied or max loops is reached."
     echo ""
+    if [ "$review_until_workflow" = pr ]; then
+        echo "Review current branch changes from merge-base with local main (or master), including worktree changes."
+        echo "Use review-changes skill; defects and actionable behavior-preserving simplifications require fixes."
+        echo ""
+    fi
     echo "Options:"
     echo "  --repo PATH       Git repository path. Defaults to the current working directory's Git root."
     echo "  --max-loops N     Maximum review/fix loops. Default: ${DEFAULT_MAX_LOOPS}."
     echo "  --log-dir PATH    Directory for logs; it must be outside the target repository."
-    echo "                    Default: <XDG_STATE_HOME or ~/.local/state>/review_untill_satisfied/<repo>/logs."
+    echo "                    Default: <XDG_STATE_HOME or ~/.local/state>/${state_namespace}/<repo>/logs."
     echo "  --fast            Use the Codex Fast service tier. Default: disabled."
     echo "  --resume [LOG]    Resume LOG, or the newest incomplete run for the repository."
     echo "  --allow-worktree-changes"
@@ -347,8 +363,9 @@ PY
 }
 
 validate_state_file() {
-    "$JSON_PYTHON" - "$1" <<'PY'
+    "$JSON_PYTHON" - "$1" "$review_until_workflow" <<'PY'
 import json
+import re
 import sys
 required = {
     "schema_version": int, "repo_path": str, "log_path": str,
@@ -372,6 +389,17 @@ bad = [key for key, kind in required.items()
 if bad:
     print(f"Invalid resume state {sys.argv[1]}: {', '.join(bad)}", file=sys.stderr)
     sys.exit(2)
+if state.get("review_mode", "changes") != sys.argv[2]:
+    print("Resume review mode does not match this script", file=sys.stderr)
+    sys.exit(2)
+if sys.argv[2] == "pr" and (
+    state.get("base_branch") not in ("main", "master")
+    or any(not isinstance(state.get(key), str)
+           or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", state[key])
+           for key in ("base_commit", "merge_base"))
+):
+    print("Invalid branch review baseline in resume state", file=sys.stderr)
+    sys.exit(2)
 if state["phase"] not in ("review", "fix") or state["phase_status"] not in (
     "pending", "running", "failed", "completed"
 ) or state["run_status"] not in ("running", "resumable", "exhausted", "passed"):
@@ -385,7 +413,8 @@ write_state() {
     local trustworthy="${2:-$fingerprint_trustworthy}"
     "$JSON_PYTHON" - "$state_file" "$project_root" "$log_file" "$service_tier" \
         "$max_loops" "$loop" "$phase" "$phase_status" "$run_status" "$session_id" \
-        "$fingerprint" "$trustworthy" "$created_at" <<'PY'
+        "$fingerprint" "$trustworthy" "$created_at" "$review_until_workflow" \
+        "$base_branch" "$base_commit" "$merge_base" <<'PY'
 import json
 import os
 import sys
@@ -393,9 +422,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 (path, repo, log, tier, max_loops, loop, phase, phase_status, run_status,
- session_id, fingerprint, trustworthy, created_at) = sys.argv[1:]
+ session_id, fingerprint, trustworthy, created_at, review_mode,
+ base_branch, base_commit, merge_base) = sys.argv[1:]
 data = {
     "schema_version": 1,
+    "review_mode": review_mode,
     "repo_path": repo,
     "log_path": log,
     "service_tier": tier,
@@ -410,6 +441,8 @@ data = {
     "created_at": created_at,
     "updated_at": datetime.now(timezone.utc).isoformat(),
 }
+if review_mode == "pr":
+    data.update(base_branch=base_branch, base_commit=base_commit, merge_base=merge_base)
 target = Path(path)
 temporary = target.with_name(target.name + f".tmp.{os.getpid()}")
 fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -537,7 +570,7 @@ default_log_dir() {
         state_root="${HOME}/.local/state"
     fi
     repo_name="$(basename -- "$project_root")"
-    printf '%s\n' "${state_root}/review_untill_satisfied/${repo_name}/logs"
+    printf '%s\n' "${state_root}/${state_namespace}/${repo_name}/logs"
 }
 
 if [ "$resume_requested" = true ] && [ "$service_tier" = "fast" ]; then
@@ -599,7 +632,7 @@ if [ "$resuming" = false ]; then
 
     if [ "$resume_requested" = true ]; then
         state_file="$("$JSON_PYTHON" - "$log_dir" "$project_root" \
-            "$max_loops_provided" "$max_loops" <<'PY'
+            "$max_loops_provided" "$max_loops" "$review_until_workflow" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -641,6 +674,7 @@ for path in directory.glob("*.log.state.json"):
         )
         if (
             state["repo_path"] == str(repo)
+            and state.get("review_mode", "changes") == sys.argv[5]
             and (status in {"running", "resumable"} or exhausted_is_extendable)
         ):
             candidates.append((state["updated_at"], path.stat().st_mtime_ns, path))
@@ -661,6 +695,40 @@ PY
         log_file="$(mktemp "${log_dir}/${exec_datetime}.XXXXXX.log")"
         chmod 600 "$log_file"
         state_file="${log_file}.state.json"
+    fi
+fi
+
+check_review_baseline() {
+    [ "$review_until_workflow" = pr ] || return 0
+    local current_base
+    if ! current_base="$(git -C "$project_root" rev-parse --verify "refs/heads/${base_branch}^{commit}" 2>/dev/null)" ||
+        [ "$current_base" != "$base_commit" ]; then
+        error "Review baseline ${base_branch} changed or disappeared; start a new run."
+        exit 2
+    fi
+}
+
+if [ "$review_until_workflow" = pr ]; then
+    if [ "$resuming" = true ]; then
+        base_branch="$(state_get base_branch)"
+        base_commit="$(state_get base_commit)"
+        merge_base="$(state_get merge_base)"
+        check_review_baseline
+    else
+        for candidate in main master; do
+            if base_commit="$(git -C "$project_root" rev-parse --verify "refs/heads/${candidate}^{commit}" 2>/dev/null)"; then
+                base_branch="$candidate"
+                break
+            fi
+        done
+        if [ -z "$base_branch" ]; then
+            error "Branch review requires a local main or master branch; no baseline found."
+            exit 2
+        fi
+        if ! merge_base="$(git -C "$project_root" merge-base "$base_commit" HEAD)"; then
+            error "Cannot compute merge-base between ${base_branch} and HEAD."
+            exit 2
+        fi
     fi
 fi
 
@@ -783,6 +851,29 @@ Return a structured final JSON message that matches the provided output schema:
 Set review_completed to true only after successfully inspecting git status, staged and unstaged diffs, and relevant untracked files and completing the review. If sandbox initialization, permissions, tools, or any other obstacle prevents completing that inspection, set review_completed=false, satisfied=false, and findings=[]; explain the obstacle in summary. An inability to verify findings is not approval. For a completed review, set satisfied to true exactly when there are no qualifying findings under the review guidelines above, and in that case return an empty findings array. Any qualifying P0-P3 finding makes satisfied false. When a completed review is unsatisfied, include one or more findings, each as an object with only an issue string. Put the priority, location, explanation, and any rule reference inside that string; do not add separate fields for them. Use summary for a brief explanation of the review result. Do not wrap the JSON in Markdown fences or extra prose.
 PROMPT
 )"
+
+
+if [ "$review_until_workflow" = pr ]; then
+    review_prompt="$(cat <<'PROMPT'
+Use $review-changes for this review-only phase. Read and follow the installed review-changes skill, including its independent sub-agent requirement and its simplify-changes dependency. Do not perform the full review in the main agent or silently fall back to ordinary review. If the skill, dependencies, or delegation capability are unavailable, return review_completed=false, satisfied=false, findings=[], and explain the obstacle in summary.
+
+Review the current branch's full changes against the fixed merge-base supplied below, plus all staged and unstaged diffs, and relevant untracked files. Inspect git status and the complete scope, including previous uncommitted fixes. Compare the baseline implementation with the current contents; deduplicate overlapping branch and worktree findings. Do not switch branches, reset, stage, commit, push, or fetch. Do not modify files or generate a PR fix.
+
+Have the independent reviewer complete defect review, behavior-preserving simplification review, and evidence verification. Return all qualifying P0-P3 defects first, followed by all actionable behavior-preserving simplification suggestions. Defect issue strings must include priority, file and precise lines, trigger, impact, evidence, and applicable repository rule references. Start simplification issue strings with [Simplify] and include file/lines, proposed operation, contracts to preserve, evidence, benefit and risk. Suggestions requiring functionality or scope changes are advisory only: report them in summary, not findings. Preserve verification results and limitations in summary. Missing required review stages or inability to inspect the full scope means review is incomplete; an inability to verify findings is not approval.
+
+Adapt the skill's report to this exact JSON schema, with no Markdown fences or additional fields:
+{
+  "review_completed": boolean,
+  "satisfied": boolean,
+  "summary": string,
+  "findings": [{"issue": string}]
+}
+Set review_completed=true only after the entire skill workflow and full scope inspection complete. For a completed review, satisfied is true exactly when findings is empty. Both defects and actionable behavior-preserving simplifications make satisfied=false. For an incomplete review, set review_completed=false, satisfied=false, and findings=[].
+PROMPT
+)"
+    review_prompt+="$(printf '\n\nFixed local baseline: %s\nBaseline commit: %s\nFixed merge-base: %s\nInspect committed branch changes with git diff %s HEAD and worktree changes with git diff HEAD; also inspect staged changes and relevant untracked files.\n' \
+        "$base_branch" "$base_commit" "$merge_base" "$merge_base")"
+fi
 
 state_initialized=false
 active_invocation_events=""
@@ -1026,6 +1117,7 @@ run_codex_phase() {
 }
 
 while [ "$loop" -le "$max_loops" ]; do
+    check_review_baseline
     if [ "$phase" = fix ] && [ "$phase_status" = completed ]; then
         loop=$((loop + 1))
         phase=review
@@ -1062,6 +1154,7 @@ while [ "$loop" -le "$max_loops" ]; do
                 fi
                 exit "$status"
             fi
+            check_review_baseline
             phase_status=completed
             run_status=resumable
             session_id=""
@@ -1082,6 +1175,7 @@ while [ "$loop" -le "$max_loops" ]; do
             error "Could not validate review JSON. See log: ${log_file}"
             exit "$status"
         fi
+        check_review_baseline
         print_review_feedback "$review_json" "$loop" "$max_loops"
         echo ""
         if [ "$review_status" = incomplete ]; then
@@ -1122,6 +1216,11 @@ while [ "$loop" -le "$max_loops" ]; do
     fix_prompt="$(printf '%s\n\n%s' \
         'Use the following structured review JSON as context. Make only minimal fixes for the listed findings, avoid unrelated refactors, and run focused verification where practical.' \
         "$(cat "$review_json")")"
+    if [ "$review_until_workflow" = pr ]; then
+        fix_prompt="$(printf '%s\n\n%s' \
+            'Use this structured review JSON to fix the listed defects and apply the listed [Simplify] suggestions while preserving their documented contracts and functionality. Do not implement advisory scope changes from summary. Avoid unrelated changes, do not commit, and run focused verification where practical.' \
+            "$(cat "$review_json")")"
+    fi
     if [ "$phase_status" != completed ]; then
         echo "Findings remain; applying minimal fixes..."
         echo "Modification prompt ${loop}/${max_loops}:"
@@ -1151,6 +1250,7 @@ while [ "$loop" -le "$max_loops" ]; do
             fi
             exit "$status"
         fi
+        check_review_baseline
         phase_status=completed
         run_status=resumable
         session_id=""

@@ -188,19 +188,21 @@ repositories, a pseudo-terminal, and a mock Codex without calling a real model.
 
 ## review_and_commit.sh
 
-Runs `review_untill_satisfied.sh`, then automatically calls `commit_by_codex.sh -y`
-only when review succeeds. Review failure, exhaustion, or interruption prevents
+Runs `review_changes_untill_satisfied.sh` by default, or
+`review_pr_untill_satisfied.sh` with `--review-scope branch`, then automatically
+calls `commit_by_codex.sh -y` only when review succeeds. Review failure, exhaustion, or interruption prevents
 the commit step. The wrapper preserves the failing step's exit code.
 
 ```bash
 ./review_and_commit.sh
+./review_and_commit.sh --review-scope branch --repo ./example-project
 ./review_and_commit.sh --repo ./example-project --max-loops 3 --fast
 ./review_and_commit.sh --repo ./example-project --model gpt-5.6-luna
 ./review_and_commit.sh --resume ./review-logs/original-run.log
 ./review_and_commit.sh --repo ./example-project --resume --allow-worktree-changes
 ```
 
-All arguments except `--model` and help are forwarded unchanged to the review
+All arguments except `--review-scope`, `--model` and help are forwarded unchanged to the review
 script, which owns argument validation and repository selection. `--model`
 selects only the commit-message model. Relative paths are interpreted from the
 caller's working directory. By default review uses the current directory's Git
@@ -209,7 +211,8 @@ from the saved run even outside a Git directory. An explicit `--repo` must match
 that run. Bare `--resume` selects the newest eligible incomplete run for the
 selected repository. The commit always targets the repository reported by a
 successful review. All review resume constraints apply, including the restriction
-on `--fast` and the rejection of already passed runs; resume cannot retry only a
+on `--fast` and the rejection of already passed runs;
+resume branch runs with `--review-scope branch`. A scope mismatch is rejected; resume cannot retry only a
 failed commit. Use `--help` for options. Dependencies are those of both child scripts;
 Git hooks and signing retain their normal behavior.
 
@@ -611,7 +614,7 @@ The last argument is treated as the log file path. For shell syntax such as pipe
 ./run_in_backend.sh bash -lc 'npm run dev | cat' /tmp/dev.log
 ```
 
-## review_untill_satisfied.sh
+## review_changes_untill_satisfied.sh
 
 Runs Codex review/fix cycles against a Git repository until the review is
 satisfied or the configured loop limit is reached.
@@ -636,7 +639,7 @@ committing; repair the environment and use `--resume` to rerun that review.
 Invalid or contradictory output also stops the workflow. There is no automatic
 retry or permission escalation.
 
-The prompt is embedded in the script and requires no runtime download. To update
+The prompt is embedded in the shared `review_until_common.sh` engine and requires no runtime download. To update
 it manually, compare the pinned upstream rubric with a new upstream commit,
 adapt its review criteria while keeping the output protocol above, and
 update the source commit and sync date in the script and this section. Run the
@@ -647,10 +650,10 @@ reviewed again. Existing fix checkpoints retain their resume behavior, and
 already passed runs remain non-resumable.
 
 ```bash
-./review_untill_satisfied.sh --repo ../my-project/
-./review_untill_satisfied.sh --repo ../my-project/ --fast
-./review_untill_satisfied.sh --resume /path/to/original-run.log
-./review_untill_satisfied.sh --repo ../my-project/ --resume
+./review_changes_untill_satisfied.sh --repo ../my-project/
+./review_changes_untill_satisfied.sh --repo ../my-project/ --fast
+./review_changes_untill_satisfied.sh --resume /path/to/original-run.log
+./review_changes_untill_satisfied.sh --repo ../my-project/ --resume
 ```
 
 The script explicitly uses the default Codex service tier, even if Fast is
@@ -658,12 +661,14 @@ enabled in user or project configuration. Pass `--fast` to use the Fast service
 tier for both review and fix steps.
 
 Logs default to
-`${XDG_STATE_HOME:-$HOME/.local/state}/review_untill_satisfied/<repo>/logs/`.
+`${XDG_STATE_HOME:-$HOME/.local/state}/review_changes_untill_satisfied/<repo>/logs/`.
 The log directory is kept outside the target repository so review/fix agents
 cannot treat the active log as a repository artifact or delete it. You can
 override the location with `--log-dir PATH`, but the resolved path must remain
 outside the target repository. Existing logs from older versions are not moved
-or deleted automatically.
+or deleted automatically. Logs in the former `review_untill_satisfied` directory
+can still be resumed with an explicit `--resume LOG`; bare `--resume` searches
+the new default directory.
 
 Every new log has private `.state.json`, `.review.json`, and `.events.jsonl`
 sidecars. They preserve loop/phase checkpoints, structured review output, the
@@ -685,6 +690,54 @@ timed out`, the current review or fix phase is stopped immediately and the
 script exits with status `124`. The failed phase, captured session, and
 worktree checkpoint remain resumable with `--resume`; this avoids waiting for
 Codex's internal reconnect attempts.
+
+## review_pr_untill_satisfied.sh
+
+Runs the same review/fix loop for the current branch's full changes using the
+installed `$review-changes` skill. It selects the local `main` branch, falling
+back to local `master` only when `main` does not exist. Remote branches are not
+used and nothing is fetched. Missing baselines or a missing merge-base stop the
+run with status `2`.
+
+The scope combines committed changes from the fixed merge-base to HEAD with
+staged, unstaged, and relevant untracked changes, including each loop's fixes.
+Review uses the skill's independent sub-agent, defect review, simplification
+review, and evidence verification. Both P0-P3 defects and actionable
+behavior-preserving simplifications prevent passing. Simplification findings
+start with `[Simplify]` and retain the proposed operation, contracts, evidence,
+benefits, and risks. Suggestions changing functionality or scope are reported
+in `summary` as advisory and are not automatically applied. Verification
+results and limitations also appear in `summary`.
+
+The skill, its `simplify-changes` dependency, and independent delegation must
+be available to the invoked Codex. Missing capabilities or incomplete review
+must return `review_completed=false`; the loop stops without applying fixes.
+The final output uses the same JSON protocol as the local changes script.
+
+```bash
+./review_pr_untill_satisfied.sh --repo ../my-project/ --max-loops 3
+./review_pr_untill_satisfied.sh --repo ../my-project/ --fast
+./review_pr_untill_satisfied.sh --repo ../my-project/ --resume
+```
+
+All options, exit codes, timeout handling, and checkpoint rules match
+`review_changes_untill_satisfied.sh`. The two entrypoints share
+`review_until_common.sh` and `terminal_tab_spinner.sh`; keep those files beside
+the entrypoints when copying them. Neither entrypoint accepts a PR URL or
+number. `review_and_commit.sh` continues to use local uncommitted review.
+
+Logs default to
+`${XDG_STATE_HOME:-$HOME/.local/state}/review_pr_untill_satisfied/<repo>/logs/`.
+New checkpoints record their review mode; branch checkpoints also record the
+baseline branch, commit, and merge-base. Explicit resume rejects another mode's
+log. Older checkpoints without a mode are accepted only by the local changes
+entrypoint. Branch review pins its original baseline throughout the run; if
+that local branch moves or disappears, start a new run, even when
+`--allow-worktree-changes` is supplied.
+
+Run mock-only tests with `bash tests/review_changes_untill_satisfied_test.sh`,
+`bash tests/review_pr_untill_satisfied_test.sh`, and
+`bash tests/review_and_commit_test.sh`.
 
 ## repeat_task.sh
 

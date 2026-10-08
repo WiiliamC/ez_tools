@@ -16,7 +16,7 @@ with tempfile.TemporaryDirectory(prefix='review-and-commit-test-') as directory:
     scripts.mkdir()
     wrapper = scripts / 'review_and_commit.sh'
     shutil.copyfile(sys.argv[1], wrapper)
-    for stage, filename in [('review', 'review_untill_satisfied.sh'), ('commit', 'commit_by_codex.sh')]:
+    for stage, filename in [('review', 'review_changes_untill_satisfied.sh'), ('review-pr', 'review_pr_untill_satisfied.sh'), ('commit', 'commit_by_codex.sh')]:
         (scripts / filename).write_text(r'''#!/usr/bin/env bash
 python3 - "$@" <<'MOCK'
 import json, os, sys
@@ -24,7 +24,7 @@ from pathlib import Path
 stage = STAGE
 with open(os.environ['CALL_LOG'], 'a') as stream:
     stream.write(json.dumps([stage, sys.argv[1:]]) + '\n')
-if stage == 'review':
+if stage.startswith('review'):
     result = Path(os.environ['REVIEW_UNTIL_RESULT_FILE'])
     Path(os.environ['RESULT_LOCATION']).write_text(str(result))
     mode = os.environ.get('RESULT_MODE', 'valid')
@@ -37,7 +37,7 @@ if stage == 'review':
         result.write_bytes(payloads[mode])
 else:
     assert 'REVIEW_UNTIL_RESULT_FILE' not in os.environ
-sys.exit(int(os.environ.get(stage.upper() + '_STATUS', '0')))
+sys.exit(int(os.environ.get(('REVIEW' if stage.startswith('review') else 'COMMIT') + '_STATUS', '0')))
 MOCK
 '''.replace('STAGE', repr(stage)))
     repo = root / 'target repo'
@@ -80,6 +80,24 @@ MOCK
         assert result.returncode == int(status) and len(calls) == 1, (result, calls)
     result, calls = run(COMMIT_STATUS='7')
     assert result.returncode == 7 and len(calls) == 2
+
+    result, calls = run(['--review-scope', 'branch', '--repo', str(repo), '--max-loops', '2'])
+    assert result.returncode == 0, result.stderr
+    assert calls == [['review-pr', ['--repo', str(repo), '--max-loops', '2']],
+                     ['commit', ['--repo', str(repo), '-y']]], calls
+    result, calls = run(['--review-scope', 'changes'])
+    assert result.returncode == 0 and calls[0] == ['review', []]
+    for options in (['--resume'], ['--resume', 'logs/original run.log']):
+        result, calls = run(['--review-scope', 'branch', *options])
+        assert result.returncode == 0 and calls[0] == ['review-pr', options]
+    for status in ('1', '2', '124', '130', '143'):
+        result, calls = run(['--review-scope', 'branch'], REVIEW_STATUS=status)
+        assert result.returncode == int(status) and calls == [['review-pr', []]]
+    result, calls = run(['--review-scope', 'branch'], COMMIT_STATUS='7')
+    assert result.returncode == 7 and len(calls) == 2
+    for tail in ([], [''], ['--fast'], ['pr'], ['unknown']):
+        result, calls = run(['--review-scope', *tail])
+        assert result.returncode == 2 and not calls
 
     for option in ('--model',):
         for tail in ([], [''], ['--fast']):

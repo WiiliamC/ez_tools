@@ -3,7 +3,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-script="${repo_root}/review_untill_satisfied.sh"
+script="${repo_root}/review_changes_untill_satisfied.sh"
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
@@ -192,7 +192,7 @@ if [[ -n "${output_last_message}" ]]; then
   fi
 else
   if [[ "${FAKE_CODEX_DELETE_REVIEW_DIR_ON_FIX:-}" == "1" ]]; then
-    rm -rf -- .review_untill_satisfied
+    rm -rf -- .review_changes_untill_satisfied
   fi
   printf '%s\n' "${prompt:-}" >"${FAKE_CODEX_FIX_PROMPT}"
 fi
@@ -466,8 +466,8 @@ if [[ "${ascii_io_status}" -ne 1 ]] ||
 fi
 
 default_state_dir="${tmp_dir}/state"
-mkdir -p "${test_repo}/.review_untill_satisfied/logs"
-printf 'active log\n' >"${test_repo}/.review_untill_satisfied/logs/active.log"
+mkdir -p "${test_repo}/.review_changes_untill_satisfied/logs"
+printf 'active log\n' >"${test_repo}/.review_changes_untill_satisfied/logs/active.log"
 rm -f "${FAKE_CODEX_STATE}"
 export FAKE_CODEX_DELETE_REVIEW_DIR_ON_FIX=1
 default_output="$(XDG_STATE_HOME="${default_state_dir}" "${script}" --repo "${test_repo}" --max-loops 2)"
@@ -479,12 +479,12 @@ if [[ "${default_output}" != *"Review passed on loop 2"* ]]; then
   exit 1
 fi
 
-if [[ -e "${test_repo}/.review_untill_satisfied" ]]; then
+if [[ -e "${test_repo}/.review_changes_untill_satisfied" ]]; then
   echo "Expected fake fix to delete the target repository's review directory" >&2
   exit 1
 fi
 
-default_log_dir="${default_state_dir}/review_untill_satisfied/$(basename "${test_repo}")/logs"
+default_log_dir="${default_state_dir}/review_changes_untill_satisfied/$(basename "${test_repo}")/logs"
 default_log_file="$(find "${default_log_dir}" -type f -name '*.log' -print -quit)"
 if [[ -z "${default_log_file}" ]]; then
   echo "Expected the default log outside the target repository" >&2
@@ -585,7 +585,7 @@ for _ in 1 2; do
 done
 unset FAKE_CODEX_REVIEW_RESPONSE
 
-unique_log_dir="${unique_state_dir}/review_untill_satisfied/$(basename "${test_repo}")/logs"
+unique_log_dir="${unique_state_dir}/review_changes_untill_satisfied/$(basename "${test_repo}")/logs"
 if [[ "$(find "${unique_log_dir}" -type f -name '*.log' | wc -l)" -ne 2 ]]; then
   echo "Expected same-second runs to create distinct log files" >&2
   exit 1
@@ -1191,7 +1191,7 @@ import time
 source, root, repo = map(Path, sys.argv[1:])
 scripts = root / 'wrapper scripts'
 scripts.mkdir()
-for name in ('review_and_commit.sh', 'review_untill_satisfied.sh', 'terminal_tab_spinner.sh'):
+for name in ('review_and_commit.sh', 'review_changes_untill_satisfied.sh', 'review_until_common.sh', 'terminal_tab_spinner.sh'):
     shutil.copyfile(source / name, scripts / name)
 (scripts / 'commit_by_codex.sh').write_text('''#!/usr/bin/env bash
 python3 - "$@" <<'COMMIT'
@@ -1202,7 +1202,7 @@ Path(os.environ['COMMIT_CALL']).write_text(json.dumps(sys.argv[1:]))
 COMMIT
 ''')
 wrapper = scripts / 'review_and_commit.sh'
-review = scripts / 'review_untill_satisfied.sh'
+review = scripts / 'review_changes_untill_satisfied.sh'
 commit_call = root / 'commit-call'
 scratch = root / 'wrapper scratch'
 scratch.mkdir()
