@@ -2,6 +2,120 @@
 
 A collection of utility tools for Linux systems.
 
+## install_clash_server.sh
+
+在 **Ubuntu 24.04 云服务器**上安装 Shadowsocks 服务，生成 PC / 手机可用的
+Clash YAML 配置和 `ss://` 导入链接。使用 Ubuntu APT 的 `shadowsocks-libev`，
+加密方式为 `chacha20-ietf-poly1305`，支持 TCP / UDP，无需 Docker、域名或证书。
+服务端监听 IPv4；云服务器必须有客户端可访问的公网 IPv4，或映射到服务器的公网端口。
+这是基础 Shadowsocks 方案，不带 TLS 伪装；网络若屏蔽此协议，安装成功也不代表能连通。
+
+### 安装与放行端口
+
+在**云服务器的仓库目录**手动执行（将示例域名替换为服务器真实公网 IPv4 或 DNS 名称）：
+
+```bash
+sudo ./install_clash_server.sh install --server proxy.example.com
+# 自定义端口（1024–65535，默认 18443）：
+# sudo ./install_clash_server.sh install --server proxy.example.com --port 23456
+./install_clash_server.sh status
+```
+
+仅支持 Ubuntu 24.04 + systemd，需要已有 `python3`、`iproute2` 和 `flock`（util-linux）。
+脚本从已配置的 Ubuntu 软件源安装包；若提示找不到包，请先启用 Ubuntu `universe`
+软件源，再重试。安装创建独立的 `ez-clash-server.service` 并设置开机启动，
+以 systemd 动态非特权用户运行，通过 systemd credential 读取密码。
+APT 可能启动软件包自带的默认服务；本脚本不覆盖其配置，也不停止已有服务。
+端口被占用时会报错退出，可换一个端口重试。
+
+在云厂商安全组 / 防火墙中放行入站 **TCP 18443 和 UDP 18443**；自定义端口时对应替换。
+服务器出站也需要允许访问目标网站及 DNS。脚本不会修改系统防火墙。
+若服务器 UFW 已启用，在**云服务器任意目录**执行：
+
+```bash
+sudo ufw status
+sudo ufw allow 18443/tcp
+sudo ufw allow 18443/udp
+```
+
+无需为了此脚本开启 UFW；如果要自行开启，先确认 SSH 端口已获放行。
+
+### PC 与手机连接
+
+生成的三个文件均保存在 `/etc/ez-clash-server/`，目录权限 `0700`、文件权限 `0600`：
+
+- `server.json`：服务端配置，含随机密码。
+- `clash.yaml`：完整客户端配置，默认将进入 Clash 的流量交给 `Cloud-SS` 节点。
+- `share-uri.txt`：同一节点的 `ss://` 链接，适合支持 Shadowsocks 导入的手机客户端。
+
+在**云服务器任意目录**查看客户端配置，再通过可信渠道保存到 PC / 手机本地文件：
+
+```bash
+sudo cat /etc/ez-clash-server/clash.yaml
+# 手机客户端支持 ss:// 时，可复制此链接导入：
+sudo cat /etc/ez-clash-server/share-uri.txt
+```
+
+也可以在 **PC 的 Bash 终端、仓库外的私人目录**通过 SSH 保存配置，示例用户和主机需替换。
+重定向使配置不回显到终端；要求该账户能通过 `sudo -n` 读取文件，否则使用上面的服务器端方法：
+
+```bash
+(umask 077; ssh admin@proxy.example.com 'sudo -n cat /etc/ez-clash-server/clash.yaml' > clash.yaml)
+```
+
+PC 上使用兼容 Clash / Mihomo YAML 的客户端，导入本地 `clash.yaml`，选中该配置与
+`PROXY → Cloud-SS`，启动连接并启用“系统代理”。需要接管不遵循系统代理的程序或 UDP
+流量时，使用客户端的 TUN 功能；具体权限和 DNS 接管由客户端设置。
+Android 上使用兼容此配置的客户端，导入后启动并允许系统 VPN 授权。
+iPhone / iPad 需确认所用客户端支持 Clash YAML；若只支持 Shadowsocks，则使用 `ss://`
+链接导入同一个节点，不能假定所有 iOS 代理应用都能导入 Clash 配置。
+
+PC 和手机可使用同一节点同时连接。配置只绑定客户端本机，不向局域网开放代理端口。
+默认规则不做国内外分流，也不保证未进入代理的流量或系统 DNS 被接管；需要时在客户端
+配置分流与 DNS/TUN。配置及导入链接包含密码，请勿提交 Git、公开发布或上传公开订阅转换网站。
+本脚本不提供公开订阅服务。
+
+### 运维、恢复与移除
+
+在**云服务器任意目录**执行：
+
+```bash
+sudo systemctl restart ez-clash-server.service
+sudo systemctl status ez-clash-server.service --no-pager
+sudo journalctl -u ez-clash-server.service -n 50 --no-pager
+sudo ss -lntu 'sport = :18443'
+```
+
+安装会拒绝覆盖已有配置，避免重跑时更换密码导致客户端失效。如果在配置生成后失败，
+先根据日志修复，再执行 `sudo systemctl daemon-reload` 和
+`sudo systemctl enable --now ez-clash-server.service`。脚本不自动回滚已安装的软件包或配置。
+服务运行但客户端无法连接时，检查公网地址、TCP/UDP 安全组、主机防火墙和客户端密码；
+再分别测试 PC 与手机蜂窝网络。配置为代理流量全走节点，可通过浏览器出口 IP 变化验证 TCP；
+UDP 需客户端支持并通过实际 UDP 应用另行验证。
+
+完全移除此脚本创建的服务和凭据（执行前保存仍需使用的配置）：
+
+```bash
+sudo systemctl disable --now ez-clash-server.service
+sudo rm -f /etc/systemd/system/ez-clash-server.service
+sudo systemctl daemon-reload
+sudo rm -rf /etc/ez-clash-server
+```
+
+随后可重新安装生成新密码，并重新导入所有客户端。软件包和其他 Shadowsocks 服务保留；
+如曾添加安全组或 UFW 放行规则，移除服务后自行删除对应规则。
+
+离线配置测试（需要 Python 3 和 PyYAML；不安装服务或修改系统）：
+
+```bash
+bash -n install_clash_server.sh
+PATH=/usr/bin:/bin bash tests/install_clash_server_test.sh
+```
+
+配置依据：[Ubuntu 24.04 软件包](https://packages.ubuntu.com/noble/shadowsocks-libev)、
+[ss-server 手册](https://manpages.ubuntu.com/manpages/noble/man1/ss-server.1.html)、
+[Mihomo Shadowsocks 配置](https://wiki.metacubex.one/en/config/proxies/ss/)。
+
 ## chatgpt_proxy.sh
 
 Launch `chatgpt` with an HTTP proxy on localhost. The optional first argument
